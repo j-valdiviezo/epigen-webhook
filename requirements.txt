@@ -1,0 +1,12 @@
+# Web server components
+flask                 # Web framework for creating the API endpoints
+uvicorn               # ASGI server for running the Flask application
+python-dotenv         # For loading environment variables from .env files
+
+# External service integrations
+requests              # HTTP library for making API calls to WhatsApp
+google-generativeai   # Google's Gemini AI API client
+
+# Utilities
+pydantic              # Data validation library
+loguru                # Better logging capabilities
