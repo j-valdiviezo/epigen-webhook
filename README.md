@@ -1,3 +1,14 @@
+---
+title: Epigen WhatsApp Webhook
+emoji: 🧬
+colorFrom: green
+colorTo: blue
+sdk: docker
+sdk_version: 3.9
+app_file: app.py
+pinned: false
+---
+
 # Epigen WhatsApp Webhook
 
 A webhook server for the Epigen WhatsApp integration. This service processes incoming WhatsApp messages using Google's Gemini AI model and responds with information about Epigen products and services.
