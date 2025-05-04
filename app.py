@@ -16,6 +16,7 @@ import requests
 from flask import Flask, request, jsonify
 from loguru import logger
 from dotenv import load_dotenv
+import sys
 
 # Load environment variables from .env file (for local development)
 # This has no effect in production where environment variables are set differently
@@ -40,7 +41,8 @@ if not GOOGLE_API_KEY:
     logger.warning("Google API key not set. AI responses will not work.")
 
 # Configure logging
-logger.add("webhook.log", rotation="500 MB", level="INFO", retention="10 days")
+#logger.add("webhook.log", rotation="500 MB", level="INFO", retention="10 days")
+logger.add(sys.stdout, level="INFO")
 
 # ==================== DATA STORAGE ====================
 
