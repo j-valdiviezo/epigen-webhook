@@ -1,0 +1,2056 @@
+"""
+WhatsApp Webhook Server for Epigen Chatbot with Ultra-Flexible Smart Reminders
+This server receives webhook events from WhatsApp via Green API,
+processes them using Google's Gemini AI model, and sends responses
+back to the user. Features ULTRA-FLEXIBLE intelligent reminder setup with DECIMAL support.
+"""
+import os
+import time
+import sys
+import re
+from typing import Dict, List, Any, Optional
+import requests
+from flask import Flask, request, jsonify
+from loguru import logger
+from dotenv import load_dotenv
+
+# Imports para recordatorios
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
+import pytz
+import atexit
+from supabase import create_client, Client
+
+# Importar módulos propios
+import knowledge_base
+import reminder_utils
+import db_utils
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Flask application
+app = Flask(__name__)
+
+# ==================== CONFIGURATION ====================
+# Get API credentials from environment variables
+GREEN_API_ID = os.environ.get("GREEN_API_ID")
+GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+
+# Supabase configuration
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
+logger.info(f"GREEN_API_ID={GREEN_API_ID}, GREEN_API_TOKEN={GREEN_API_TOKEN}")
+logger.info(f"SUPABASE_URL={SUPABASE_URL}")
+
+# Check if required environment variables are set
+if not GREEN_API_ID or not GREEN_API_TOKEN:
+    logger.warning("WhatsApp API credentials not set. Webhook will not be able to send messages.")
+if not GOOGLE_API_KEY:
+    logger.warning("Google API key not set. AI responses will not work.")
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    logger.warning("Supabase credentials not set. Reminders will not work.")
+
+# Configure logging
+logger.remove()
+logger.add(sys.stdout, level="INFO")
+
+# ==================== INITIALIZATION ====================
+# Initialize Supabase client
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_ANON_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+# Initialize scheduler
+scheduler = BackgroundScheduler(timezone=pytz.timezone('America/Mexico_City'))
+scheduler.start()
+
+# Ensure scheduler shuts down properly
+atexit.register(lambda: scheduler.shutdown())
+
+# ==================== RECORDATORIO FUNCIONES ====================
+
+def send_reminder(user_phone: str, message: str):
+    """Enviar un mensaje de recordatorio"""
+    try:
+        send_result = send_whatsapp_message(user_phone, f"{message}")
+        logger.info(f"Reminder sent to {user_phone}: {message}")
+        return send_result
+    except Exception as e:
+        logger.error(f"Error sending reminder to {user_phone}: {str(e)}")
+        return None
+
+#def create_intelligent_reminder(user_phone: str, reminder_info: dict):
+#    """Crear recordatorio con mejor manejo de tipos y soporte decimal"""
+#    logger.info(f"Creating intelligent reminder for {user_phone}: {reminder_info}")
+#    
+#    try:
+#        reminder_type = reminder_info["type"]
+#        message = reminder_info["message"]
+#        display_name = reminder_info.get("display_name", "")
+#        
+#        # Gestionar recordatorio basado en intervalo
+#        if "interval_minutes" in reminder_info and reminder_info.get("interval_minutes") is not None:
+#            interval_minutes = float(reminder_info["interval_minutes"])
+#            
+#            # Validar intervalo mínimo (1 segundo = 0.0167 minutos)
+#            if interval_minutes < 0.0167:
+#                return "❌ El intervalo mínimo es 1 segundo. Por favor elige un intervalo mayor."
+#            
+#            logger.info(f"Creating {reminder_type} reminder: {interval_minutes} minutes interval")
+#            
+#            reminder_id = db_utils.save_reminder_supabase(
+#                supabase=supabase,
+#                user_phone=user_phone,
+#                reminder_type=reminder_type,
+#                message=message,
+#                display_name=display_name,
+#                interval_minutes=interval_minutes
+#            )
+#            
+#            logger.info(f"Supabase save result: reminder_id = {reminder_id}")
+#            
+#            if reminder_id:
+#                try:
+#                    job = scheduler.add_job(
+#                        func=send_reminder,
+#                        trigger=IntervalTrigger(minutes=interval_minutes),
+#                        args=[user_phone, message],
+#                        id=f"{reminder_type}_{user_phone}_{reminder_id}",
+#                        replace_existing=True
+#                    )
+#                    logger.info(f"Scheduler job created: {job.id} - Next run: {job.next_run_time}")
+#                except Exception as scheduler_error:
+#                    logger.error(f"Scheduler error: {scheduler_error}")
+#                    return f"❌ Error al programar recordatorio: {scheduler_error}"
+#                
+#                emoji = reminder_utils.REMINDER_EMOJIS.get(reminder_type, "🔔")
+#                freq_text = reminder_utils.format_interval_text(interval_minutes)
+#                
+#                # Personalizar respuesta según el tipo
+#                if reminder_type == "water":
+#                    return f"✅ ¡Perfecto! He configurado tu recordatorio de agua {freq_text}.\n\n{emoji} Te recordaré mantenerte hidratado regularmente.\n\n🔍 Recordatorio: *{display_name}*"
+#                elif reminder_type == "supplement":
+#                    supplement_name = reminder_info.get("supplement_name", "suplemento")
+#                    return f"✅ ¡Listo! He configurado tu recordatorio para *{supplement_name}* {freq_text}.\n\n{emoji} Te recordaré tomarlo regularmente.\n\n🔍 Recordatorio: *{display_name}*"
+#                else:
+#                    return f"✅ ¡Listo! He configurado tu recordatorio de {reminder_type} {freq_text}.\n\n{emoji} Te lo recordaré puntualmente.\n\n🔍 Recordatorio: *{display_name}*"
+#            else:
+#                logger.error("Failed to save reminder to Supabase")
+#                return "❌ Error al guardar recordatorio en la base de datos. Por favor intenta de nuevo."
+#        
+#        # Gestionar recordatorio basado en horarios específicos
+#        elif "times" in reminder_info and reminder_info["times"]:
+#            times = reminder_info["times"]
+#            logger.info(f"Creating {reminder_type} reminder with specific times: {times}")
+#            
+#            created_count = 0
+#            created_names = []
+#            
+#            for time_str in times:
+#                try:
+#                    hour, minute = map(int, time_str.split(':'))
+#                    time_display_name = f"{display_name} ({time_str})"
+#                    
+#                    reminder_id = db_utils.save_reminder_supabase(
+#                        supabase=supabase,
+#                        user_phone=user_phone,
+#                        reminder_type=reminder_type,
+#                        message=message,
+#                        display_name=time_display_name,
+#                        cron_expression=f"{minute} {hour} * * *"
+#                    )
+#                    
+#                    if reminder_id:
+#                        scheduler.add_job(
+#                            func=send_reminder,
+#                            trigger=CronTrigger(hour=hour, minute=minute),
+#                            args=[user_phone, message],
+#                            id=f"{reminder_type}_{user_phone}_{reminder_id}",
+#                            replace_existing=True
+#                        )
+#                        created_count += 1
+#                        created_names.append(time_display_name)
+#                        
+#                except Exception as e:
+#                    logger.error(f"Error creating reminder at {time_str}: {str(e)}")
+#                    continue
+#            
+#            if created_count > 0:
+#                emoji = reminder_utils.REMINDER_EMOJIS.get(reminder_type, "🔔")
+#                times_text = ", ".join(times)
+#                names_text = ", ".join([f"*{name}*" for name in created_names])
+#                
+#                # Personalizar respuesta según el tipo
+#                if reminder_type == "sleep":
+#                    return f"✅ ¡Perfecto! He configurado tu recordatorio para dormir a las {times_text}.\n\n{emoji} Te ayudaré a mantener un buen hábito de sueño.\n\n🔍 Recordatorios: {names_text}"
+#                elif reminder_type == "supplement":
+#                    supplement_name = reminder_info.get("supplement_name", "suplemento")
+#                    return f"✅ ¡Listo! He configurado tu recordatorio para *{supplement_name}* a las {times_text}.\n\n{emoji} Te recordaré tomarlo puntualmente.\n\n🔍 Recordatorios: {names_text}"
+#                else:
+#                    return f"✅ ¡Configurado! Tu recordatorio de {reminder_type} a las {times_text}.\n\n{emoji} Te lo recordaré puntualmente.\n\n🔍 Recordatorios: {names_text}"
+#            else:
+#                return "❌ No pude configurar los recordatorios con los horarios especificados. Por favor intenta de nuevo."
+#        
+#        # Si no hay ni intervalo ni horarios específicos
+#        else:
+#            logger.error("No valid time or interval information found")
+#            return "❌ No pude entender los horarios para tu recordatorio. Por favor especifica cuándo quieres que te recuerde."
+#        
+#    except Exception as e:
+#        logger.error(f"Error creating intelligent reminder: {str(e)}")
+#        return f"❌ Hubo un error al configurar el recordatorio: {str(e)}"
+
+def create_intelligent_reminder(user_phone: str, reminder_info: dict):
+    """Crear recordatorio con mejor manejo de tipos y soporte decimal"""
+    logger.info(f"Creating intelligent reminder for {user_phone}: {reminder_info}")
+    
+    try:
+        reminder_type = reminder_info["type"]
+        message = reminder_info["message"]
+        
+        # Asegurar que display_name tenga un valor válido
+        display_name = reminder_info.get("display_name", "")
+        if not display_name or display_name == "None":
+            # Generar un nombre descriptivo basado en el tipo
+            if reminder_type == "supplement" and reminder_info.get("supplement_name"):
+                display_name = f"Recordatorio de {reminder_info['supplement_name']}"
+            else:
+                display_name = reminder_utils.generate_reminder_name(reminder_type)
+        
+        # Gestionar recordatorio basado en intervalo
+        if "interval_minutes" in reminder_info and reminder_info.get("interval_minutes") is not None:
+            interval_minutes = float(reminder_info["interval_minutes"])
+            
+            # Validar intervalo mínimo (1 segundo = 0.0167 minutos)
+            if interval_minutes < 0.0167:
+                return "❌ El intervalo mínimo es 1 segundo. Por favor elige un intervalo mayor."
+            
+            logger.info(f"Creating {reminder_type} reminder: {interval_minutes} minutes interval")
+            
+            # Configurar el nickname solo para suplementos específicos
+            nickname = None
+            if reminder_type == "supplement" and reminder_info.get("supplement_name"):
+                nickname = reminder_info["supplement_name"]
+            
+            # Llamada a la función save_reminder_supabase sin pasar nickname si es None
+            if nickname:
+                reminder_id = db_utils.save_reminder_supabase(
+                    supabase=supabase,
+                    user_phone=user_phone,
+                    reminder_type=reminder_type,
+                    message=message,
+                    display_name=display_name,
+                    interval_minutes=interval_minutes,
+                    nickname=nickname
+                )
+            else:
+                reminder_id = db_utils.save_reminder_supabase(
+                    supabase=supabase,
+                    user_phone=user_phone,
+                    reminder_type=reminder_type,
+                    message=message,
+                    display_name=display_name,
+                    interval_minutes=interval_minutes
+                )
+            
+            logger.info(f"Supabase save result: reminder_id = {reminder_id}")
+            
+            if reminder_id:
+                try:
+                    job = scheduler.add_job(
+                        func=send_reminder,
+                        trigger=IntervalTrigger(minutes=interval_minutes),
+                        args=[user_phone, message],
+                        id=f"{reminder_type}_{user_phone}_{reminder_id}",
+                        replace_existing=True
+                    )
+                    logger.info(f"Scheduler job created: {job.id} - Next run: {job.next_run_time}")
+                except Exception as scheduler_error:
+                    logger.error(f"Scheduler error: {scheduler_error}")
+                    return f"❌ Error al programar recordatorio: {scheduler_error}"
+                
+                emoji = reminder_utils.REMINDER_EMOJIS.get(reminder_type, "🔔")
+                freq_text = reminder_utils.format_interval_text(interval_minutes)
+                
+                # Personalizar respuesta según el tipo
+                if reminder_type == "water":
+                    return f"✅ ¡Perfecto! He configurado tu recordatorio de agua {freq_text}.\n\n{emoji} Te recordaré mantenerte hidratado regularmente.\n\n🔍 Recordatorio: *{display_name}*"
+                elif reminder_type == "supplement":
+                    supplement_name = reminder_info.get("supplement_name", "suplemento")
+                    return f"✅ ¡Listo! He configurado tu recordatorio para *{supplement_name}* {freq_text}.\n\n{emoji} Te recordaré tomarlo regularmente.\n\n🔍 Recordatorio: *{display_name}*"
+                else:
+                    return f"✅ ¡Listo! He configurado tu recordatorio de {reminder_type} {freq_text}.\n\n{emoji} Te lo recordaré puntualmente.\n\n🔍 Recordatorio: *{display_name}*"
+            else:
+                logger.error("Failed to save reminder to Supabase")
+                return "❌ Error al guardar recordatorio en la base de datos. Por favor intenta de nuevo."
+        
+        # Gestionar recordatorio basado en horarios específicos
+        elif "times" in reminder_info and reminder_info["times"]:
+            times = reminder_info["times"]
+            logger.info(f"Creating {reminder_type} reminder with specific times: {times}")
+            
+            created_count = 0
+            created_names = []
+            
+            for time_str in times:
+                try:
+                    hour, minute = map(int, time_str.split(':'))
+                    
+                    # Crear un nombre único para cada hora
+                    if reminder_type == "supplement" and reminder_info.get("supplement_name"):
+                        time_display_name = f"{reminder_info['supplement_name']} ({time_str})"
+                    else:
+                        base_name = display_name.split(" (")[0]  # Quitar hora anterior si existe
+                        time_display_name = f"{base_name} ({time_str})"
+                    
+                    # Configurar el nickname solo para suplementos específicos
+                    nickname = None
+                    if reminder_type == "supplement" and reminder_info.get("supplement_name"):
+                        nickname = f"{reminder_info['supplement_name']} {time_str}"
+                    
+                    # Llamada a la función save_reminder_supabase sin pasar nickname si es None
+                    if nickname:
+                        reminder_id = db_utils.save_reminder_supabase(
+                            supabase=supabase,
+                            user_phone=user_phone,
+                            reminder_type=reminder_type,
+                            message=message,
+                            display_name=time_display_name,
+                            cron_expression=f"{minute} {hour} * * *",
+                            nickname=nickname
+                        )
+                    else:
+                        reminder_id = db_utils.save_reminder_supabase(
+                            supabase=supabase,
+                            user_phone=user_phone,
+                            reminder_type=reminder_type,
+                            message=message,
+                            display_name=time_display_name,
+                            cron_expression=f"{minute} {hour} * * *"
+                        )
+                    
+                    if reminder_id:
+                        scheduler.add_job(
+                            func=send_reminder,
+                            trigger=CronTrigger(hour=hour, minute=minute),
+                            args=[user_phone, message],
+                            id=f"{reminder_type}_{user_phone}_{reminder_id}",
+                            replace_existing=True
+                        )
+                        created_count += 1
+                        created_names.append(time_display_name)
+                        
+                except Exception as e:
+                    logger.error(f"Error creating reminder at {time_str}: {str(e)}")
+                    continue
+            
+            if created_count > 0:
+                emoji = reminder_utils.REMINDER_EMOJIS.get(reminder_type, "🔔")
+                times_text = ", ".join(times)
+                names_text = ", ".join([f"*{name}*" for name in created_names])
+                
+                # Personalizar respuesta según el tipo
+                if reminder_type == "sleep":
+                    return f"✅ ¡Perfecto! He configurado tu recordatorio para dormir a las {times_text}.\n\n{emoji} Te ayudaré a mantener un buen hábito de sueño.\n\n🔍 Recordatorios: {names_text}"
+                elif reminder_type == "supplement":
+                    supplement_name = reminder_info.get("supplement_name", "suplemento")
+                    return f"✅ ¡Listo! He configurado tu recordatorio para *{supplement_name}* a las {times_text}.\n\n{emoji} Te recordaré tomarlo puntualmente.\n\n🔍 Recordatorios: {names_text}"
+                else:
+                    return f"✅ ¡Configurado! Tu recordatorio de {reminder_type} a las {times_text}.\n\n{emoji} Te lo recordaré puntualmente.\n\n🔍 Recordatorios: {names_text}"
+            else:
+                return "❌ No pude configurar los recordatorios con los horarios especificados. Por favor intenta de nuevo."
+        
+        # Si no hay ni intervalo ni horarios específicos
+        else:
+            logger.error("No valid time or interval information found")
+            return "❌ No pude entender los horarios para tu recordatorio. Por favor especifica cuándo quieres que te recuerde."
+        
+    except Exception as e:
+        logger.error(f"Error creating intelligent reminder: {str(e)}")
+        return f"❌ Hubo un error al configurar el recordatorio: {str(e)}"
+
+#def create_intelligent_reminder(user_phone: str, reminder_info: dict):
+#    """Crear recordatorio con mejor manejo de tipos y soporte decimal"""
+#    logger.info(f"Creating intelligent reminder for {user_phone}: {reminder_info}")
+#    
+#    try:
+#        reminder_type = reminder_info["type"]
+#        message = reminder_info["message"]
+#        
+#        # Asegurar que display_name tenga un valor válido
+#        display_name = reminder_info.get("display_name", "")
+#        if not display_name or display_name == "None":
+#            # Generar un nombre descriptivo basado en el tipo
+#            if reminder_type == "supplement" and reminder_info.get("supplement_name"):
+#                display_name = f"Recordatorio de {reminder_info['supplement_name']}"
+#            else:
+#                display_name = reminder_utils.generate_reminder_name(reminder_type)
+#        
+#        # Gestionar recordatorio basado en intervalo
+#        if "interval_minutes" in reminder_info and reminder_info.get("interval_minutes") is not None:
+#            interval_minutes = float(reminder_info["interval_minutes"])
+#            
+#            # Validar intervalo mínimo (1 segundo = 0.0167 minutos)
+#            if interval_minutes < 0.0167:
+#                return "❌ El intervalo mínimo es 1 segundo. Por favor elige un intervalo mayor."
+#            
+#            logger.info(f"Creating {reminder_type} reminder: {interval_minutes} minutes interval")
+#            
+#            # Configurar el nickname para suplementos específicos
+#            nickname = None
+#            if reminder_type == "supplement" and reminder_info.get("supplement_name"):
+#                nickname = reminder_info["supplement_name"]
+#            
+#            reminder_id = db_utils.save_reminder_supabase(
+#                supabase=supabase,
+#                user_phone=user_phone,
+#                reminder_type=reminder_type,
+#                message=message,
+#                display_name=display_name,
+#                interval_minutes=interval_minutes,
+#                nickname=nickname
+#            )
+#            
+#            logger.info(f"Supabase save result: reminder_id = {reminder_id}")
+#            
+#            if reminder_id:
+#                try:
+#                    job = scheduler.add_job(
+#                        func=send_reminder,
+#                        trigger=IntervalTrigger(minutes=interval_minutes),
+#                        args=[user_phone, message],
+#                        id=f"{reminder_type}_{user_phone}_{reminder_id}",
+#                        replace_existing=True
+#                    )
+#                    logger.info(f"Scheduler job created: {job.id} - Next run: {job.next_run_time}")
+#                except Exception as scheduler_error:
+#                    logger.error(f"Scheduler error: {scheduler_error}")
+#                    return f"❌ Error al programar recordatorio: {scheduler_error}"
+#                
+#                emoji = reminder_utils.REMINDER_EMOJIS.get(reminder_type, "🔔")
+#                freq_text = reminder_utils.format_interval_text(interval_minutes)
+#                
+#                # Personalizar respuesta según el tipo
+#                if reminder_type == "water":
+#                    return f"✅ ¡Perfecto! He configurado tu recordatorio de agua {freq_text}.\n\n{emoji} Te recordaré mantenerte hidratado regularmente.\n\n🔍 Recordatorio: *{display_name}*"
+#                elif reminder_type == "supplement":
+#                    supplement_name = reminder_info.get("supplement_name", "suplemento")
+#                    return f"✅ ¡Listo! He configurado tu recordatorio para *{supplement_name}* {freq_text}.\n\n{emoji} Te recordaré tomarlo regularmente.\n\n🔍 Recordatorio: *{display_name}*"
+#                else:
+#                    return f"✅ ¡Listo! He configurado tu recordatorio de {reminder_type} {freq_text}.\n\n{emoji} Te lo recordaré puntualmente.\n\n🔍 Recordatorio: *{display_name}*"
+#            else:
+#                logger.error("Failed to save reminder to Supabase")
+#                return "❌ Error al guardar recordatorio en la base de datos. Por favor intenta de nuevo."
+#        
+#        # Gestionar recordatorio basado en horarios específicos
+#        elif "times" in reminder_info and reminder_info["times"]:
+#            times = reminder_info["times"]
+#            logger.info(f"Creating {reminder_type} reminder with specific times: {times}")
+#            
+#            created_count = 0
+#            created_names = []
+#            
+#            for time_str in times:
+#                try:
+#                    hour, minute = map(int, time_str.split(':'))
+#                    
+#                    # Crear un nombre único para cada hora
+#                    if reminder_type == "supplement" and reminder_info.get("supplement_name"):
+#                        time_display_name = f"{reminder_info['supplement_name']} ({time_str})"
+#                    else:
+#                        base_name = display_name.split(" (")[0]  # Quitar hora anterior si existe
+#                        time_display_name = f"{base_name} ({time_str})"
+#                    
+#                    # Configurar el nickname para suplementos específicos
+#                    nickname = None
+#                    if reminder_type == "supplement" and reminder_info.get("supplement_name"):
+#                        nickname = f"{reminder_info['supplement_name']} {time_str}"
+#                    
+#                    reminder_id = db_utils.save_reminder_supabase(
+#                        supabase=supabase,
+#                        user_phone=user_phone,
+#                        reminder_type=reminder_type,
+#                        message=message,
+#                        display_name=time_display_name,
+#                        cron_expression=f"{minute} {hour} * * *",
+#                        nickname=nickname
+#                    )
+#                    
+#                    if reminder_id:
+#                        scheduler.add_job(
+#                            func=send_reminder,
+#                            trigger=CronTrigger(hour=hour, minute=minute),
+#                            args=[user_phone, message],
+#                            id=f"{reminder_type}_{user_phone}_{reminder_id}",
+#                            replace_existing=True
+#                        )
+#                        created_count += 1
+#                        created_names.append(time_display_name)
+#                        
+#                except Exception as e:
+#                    logger.error(f"Error creating reminder at {time_str}: {str(e)}")
+#                    continue
+#            
+#            if created_count > 0:
+#                emoji = reminder_utils.REMINDER_EMOJIS.get(reminder_type, "🔔")
+#                times_text = ", ".join(times)
+#                names_text = ", ".join([f"*{name}*" for name in created_names])
+#                
+#                # Personalizar respuesta según el tipo
+#                if reminder_type == "sleep":
+#                    return f"✅ ¡Perfecto! He configurado tu recordatorio para dormir a las {times_text}.\n\n{emoji} Te ayudaré a mantener un buen hábito de sueño.\n\n🔍 Recordatorios: {names_text}"
+#                elif reminder_type == "supplement":
+#                    supplement_name = reminder_info.get("supplement_name", "suplemento")
+#                    return f"✅ ¡Listo! He configurado tu recordatorio para *{supplement_name}* a las {times_text}.\n\n{emoji} Te recordaré tomarlo puntualmente.\n\n🔍 Recordatorios: {names_text}"
+#                else:
+#                    return f"✅ ¡Configurado! Tu recordatorio de {reminder_type} a las {times_text}.\n\n{emoji} Te lo recordaré puntualmente.\n\n🔍 Recordatorios: {names_text}"
+#            else:
+#                return "❌ No pude configurar los recordatorios con los horarios especificados. Por favor intenta de nuevo."
+#        
+#        # Si no hay ni intervalo ni horarios específicos
+#        else:
+#            logger.error("No valid time or interval information found")
+#            return "❌ No pude entender los horarios para tu recordatorio. Por favor especifica cuándo quieres que te recuerde."
+#        
+#    except Exception as e:
+#        logger.error(f"Error creating intelligent reminder: {str(e)}")
+#        return f"❌ Hubo un error al configurar el recordatorio: {str(e)}"
+
+#def list_user_reminders_intelligent(user_phone: str):
+#    """Listar recordatorios con mejor formato para decimales y tipos"""
+#    try:
+#        reminders = db_utils.get_user_reminders_supabase(supabase, user_phone)
+#        logger.info(f"Found {len(reminders)} reminders for {user_phone}")
+#        
+#        if not reminders:
+#            return "📝 No tienes recordatorios activos.\n\n💡 Dime qué quieres recordar y yo lo configuro automáticamente."
+#        
+#        response = "📝 *Tus recordatorios activos:*\n\n"
+#        
+#        # Agrupar recordatorios por tipo para mejor visualización
+#        reminder_groups = {}
+#        for i, reminder in enumerate(reminders, 1):
+#            reminder_type = reminder["reminder_type"]
+#            if reminder_type not in reminder_groups:
+#                reminder_groups[reminder_type] = []
+#            reminder_groups[reminder_type].append(reminder)
+#        
+#        # Mostrar recordatorios organizados por tipo
+#        count = 1
+#        for reminder_type, group in reminder_groups.items():
+#            emoji = reminder_utils.REMINDER_EMOJIS.get(reminder_type, "🔔")
+#            
+#            for reminder in group:
+#                # Usar nickname si existe, o generar un nombre de display_name basado en el tipo
+#                display_name = reminder.get("nickname", reminder_type.capitalize())
+#                
+#                if reminder["interval_minutes"]:
+#                    interval = float(reminder["interval_minutes"])
+#                    freq_text = reminder_utils.format_interval_text(interval)
+#                    response += f"{count}. {emoji} {display_name}: {freq_text} (ID: {reminder['id']})\n"
+#                else:
+#                    # Extraer hora del cron si está disponible
+#                    time_str = "horario específico"
+#                    if reminder["cron_expression"]:
+#                        parts = reminder["cron_expression"].split()
+#                        if len(parts) >= 2:
+#                            minute, hour = parts[0], parts[1]
+#                            time_str = f"{hour}:{minute.zfill(2)}"
+#                    
+#                    response += f"{count}. {emoji} {display_name}: {time_str} (ID: {reminder['id']})\n"
+#                count += 1
+#        
+#        response += "\n💡 Para detener todos los recordatorios, escribe: */borrar_todo*"
+#        response += "\n💡 Para eliminar uno específico, escribe: *Elimina recordatorio 3*" 
+#        return response
+#        
+#    except Exception as e:
+#        logger.error(f"Error listing user reminders: {str(e)}")
+#        return "❌ Error al obtener tus recordatorios. Inténtalo de nuevo."
+
+def list_user_reminders_intelligent(user_phone: str):
+    """Listar recordatorios con mejor formato para decimales y tipos"""
+    try:
+        reminders = db_utils.get_user_reminders_supabase(supabase, user_phone)
+        logger.info(f"Found {len(reminders)} reminders for {user_phone}")
+        
+        if not reminders:
+            return "📝 No tienes recordatorios activos.\n\n💡 Dime qué quieres recordar y yo lo configuro automáticamente."
+        
+        response = "📝 *Tus recordatorios activos:*\n\n"
+        
+        # Agrupar recordatorios por tipo para mejor visualización
+        reminder_groups = {}
+        for i, reminder in enumerate(reminders, 1):
+            reminder_type = reminder["reminder_type"]
+            if reminder_type not in reminder_groups:
+                reminder_groups[reminder_type] = []
+            reminder_groups[reminder_type].append(reminder)
+        
+        # Mostrar recordatorios organizados por tipo
+        count = 1
+        for reminder_type, group in reminder_groups.items():
+            emoji = reminder_utils.REMINDER_EMOJIS.get(reminder_type, "🔔")
+            
+            for reminder in group:
+                # MODIFICACIÓN: Obtener nombre descriptivo del recordatorio
+                # Priorizar: nickname > display_name > tipo capitalizado
+                display_name = reminder.get("nickname", "")
+                if not display_name or display_name == "None":
+                    display_name = reminder.get("display_name", "")
+                if not display_name or display_name == "None":
+                    # Fallback a un nombre basado en el tipo
+                    if reminder_type == "water":
+                        display_name = "Agua"
+                    elif reminder_type == "supplement":
+                        display_name = "Suplemento"
+                    elif reminder_type == "sleep":
+                        display_name = "Dormir"
+                    elif reminder_type == "meditation":
+                        display_name = "Meditación"
+                    elif reminder_type == "exercise":
+                        display_name = "Ejercicio"
+                    else:
+                        display_name = reminder_type.capitalize()
+                
+                if reminder["interval_minutes"]:
+                    interval = float(reminder["interval_minutes"])
+                    freq_text = reminder_utils.format_interval_text(interval)
+                    response += f"{count}. {emoji} {display_name}: {freq_text} (ID: {reminder['id']})\n"
+                else:
+                    # Extraer hora del cron si está disponible
+                    time_str = "horario específico"
+                    if reminder["cron_expression"]:
+                        parts = reminder["cron_expression"].split()
+                        if len(parts) >= 2:
+                            minute, hour = parts[0], parts[1]
+                            time_str = f"{hour}:{minute.zfill(2)}"
+                    
+                    response += f"{count}. {emoji} {display_name}: {time_str} (ID: {reminder['id']})\n"
+                count += 1
+        
+        response += "\n💡 Para detener todos los recordatorios, escribe: */borrar_todo*"
+        response += "\n💡 Para eliminar uno específico, escribe: *Elimina recordatorio [ID]*" 
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error listing user reminders: {str(e)}")
+        return "❌ Error al obtener tus recordatorios. Inténtalo de nuevo."
+
+def load_and_schedule_reminders():
+    """Cargar y programar todos los recordatorios desde Supabase con soporte decimal"""
+    try:
+        reminders = db_utils.load_reminders_supabase(supabase)
+        scheduled_count = 0
+        
+        for reminder in reminders:
+            try:
+                user_phone = reminder["user_phone"]
+                reminder_type = reminder["reminder_type"]
+                message = reminder["message"]
+                reminder_id = reminder["id"]
+                
+                if reminder["interval_minutes"]:
+                    interval_minutes = float(reminder["interval_minutes"])  # Convertir a float
+                    
+                    scheduler.add_job(
+                        func=send_reminder,
+                        trigger=IntervalTrigger(minutes=interval_minutes),
+                        args=[user_phone, message],
+                        id=f"{reminder_type}_{user_phone}_{reminder_id}",
+                        replace_existing=True
+                    )
+                    scheduled_count += 1
+                    logger.info(f"Scheduled interval reminder: {interval_minutes} minutes")
+                    
+                elif reminder["cron_expression"]:
+                    parts = reminder["cron_expression"].split()
+                    if len(parts) >= 2:
+                        minute, hour = int(parts[0]), int(parts[1])
+                        
+                        scheduler.add_job(
+                            func=send_reminder,
+                            trigger=CronTrigger(minute=minute, hour=hour),
+                            args=[user_phone, message],
+                            id=f"{reminder_type}_{user_phone}_{reminder_id}",
+                            replace_existing=True
+                        )
+                        scheduled_count += 1
+                        logger.info(f"Scheduled cron reminder: {hour}:{minute:02d}")
+                        
+            except Exception as e:
+                logger.error(f"Error scheduling reminder {reminder.get('id', 'unknown')}: {str(e)}")
+                continue
+        
+        logger.info(f"Successfully scheduled {scheduled_count} reminders from Supabase")
+        return scheduled_count
+        
+    except Exception as e:
+        logger.error(f"Error loading reminders from Supabase: {str(e)}")
+        return 0
+
+# ==================== MESSAGE PROCESSING ====================
+
+#def process_message(sender: str, message_text: str) -> str:
+#    """Process a message - VERSIÓN MEJORADA con mejor detección de intención"""
+#    try:
+#        logger.info(f"Processing message from {sender}: '{message_text}'")
+#        
+#        # Verificar si es un comando manual de recordatorio
+#        if message_text.lower().startswith('/'):
+#            logger.info("Processing as manual command")
+#            return handle_reminder_command(sender, message_text)
+#        
+#        # Obtener o inicializar historial del usuario desde Supabase
+#        chat_history = db_utils.get_chat_history_from_supabase(supabase, sender, limit=20)
+#        
+#        if not chat_history:
+#            chat_history = db_utils.initialize_user_chat(supabase, sender)
+#        
+#        # Guardar mensaje del usuario en Supabase
+#        user_message_id = db_utils.save_message_to_supabase(supabase, sender, "user", message_text)
+#        logger.info(f"User message saved with ID: {user_message_id}")
+#        
+#        # PASO 1: Verificar si es una consulta sobre recordatorios existentes
+#        if reminder_utils.parse_reminder_query(message_text, sender):
+#            logger.info("DETECTED REMINDER QUERY - Listing reminders...")
+#            response = list_user_reminders_intelligent(sender)
+#            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#            return response
+#        
+#        # PASO 2: Verificar si es una solicitud de eliminación de recordatorio específico
+#        reminder_id_to_remove = reminder_utils.parse_reminder_removal(message_text, sender)
+#        if reminder_id_to_remove is not None:
+#            logger.info(f"DETECTED REMINDER REMOVAL REQUEST - Removing reminder {reminder_id_to_remove}...")
+#            success = db_utils.deactivate_reminder_supabase(supabase, sender, reminder_id_to_remove)
+#            
+#            if success:
+#                # Intentar también detener el job en el scheduler
+#                try:
+#                    for job in scheduler.get_jobs():
+#                        if f"_{sender}_{reminder_id_to_remove}" in job.id:
+#                            scheduler.remove_job(job.id)
+#                            logger.info(f"Removed scheduler job for reminder ID {reminder_id_to_remove}")
+#                except Exception as e:
+#                    logger.error(f"Error removing scheduler job: {str(e)}")
+#                
+#                response = f"✅ Recordatorio #{reminder_id_to_remove} eliminado correctamente."
+#            else:
+#                response = f"❌ No pude eliminar el recordatorio con ID {reminder_id_to_remove}. ¿Seguro que es correcto?"
+#            
+#            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#            return response
+#        
+#        # PASO 3: Verificar si es una solicitud de información sobre productos o suplementos
+#        if reminder_utils.is_information_request(message_text) or reminder_utils.is_specific_product_request(message_text):
+#            logger.info("DETECTED INFORMATION REQUEST - Generating AI response...")
+#            
+#            current_history = chat_history.copy()
+#            current_history.append({"role": "user", "content": message_text})
+#            
+#            response = generate_ai_response_with_context(
+#                current_history, 
+#                message_text, 
+#                sender
+#            )
+#            
+#            ai_message_id = db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#            logger.info(f"Generated and saved AI information response")
+#            return response
+#        
+#        # PASO 4: Verificar si es una solicitud de creación de recordatorio (ULTRA-FLEXIBLE)
+#        reminder_info = reminder_utils.parse_reminder_request(message_text, sender)
+#        
+#        if reminder_info and reminder_info.get("detected"):
+#            logger.info("DETECTED FLEXIBLE REMINDER REQUEST - Creating reminder...")
+#            response = create_intelligent_reminder(sender, reminder_info)
+#            logger.info(f"Reminder creation response: {response}")
+#            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#            return response
+#        
+#        # PASO 5: Procesar como conversación normal
+#        logger.info("No specific intent detected - processing as normal conversation")
+#        
+#        current_history = chat_history.copy()
+#        current_history.append({"role": "user", "content": message_text})
+#        
+#        # Generate AI response with retry mechanism
+#        max_retries = 3
+#        for attempt in range(max_retries):
+#            try:
+#                response = generate_ai_response_with_context(
+#                    current_history, 
+#                    message_text, 
+#                    sender
+#                )
+#                
+#                ai_message_id = db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#                
+#                if ai_message_id:
+#                    logger.info(f"Generated and saved AI response")
+#                    return response
+#                else:
+#                    logger.error(f"Failed to save AI response for {sender}")
+#                    return response
+#            
+#            except Exception as e:
+#                logger.error(f"Attempt {attempt+1}/{max_retries} failed: {str(e)}")
+#                if attempt == max_retries - 1:
+#                    raise
+#                time.sleep(1)
+#        
+#    except Exception as e:
+#        logger.error(f"Error processing message: {str(e)}")
+#        return "Lo siento, tuve un problema procesando tu mensaje. Por favor intenta de nuevo."
+
+
+
+
+# CHANGES
+#def process_message(sender: str, message_text: str) -> str:
+#    """Process a message - VERSIÓN MEJORADA con mejor detección de intención"""
+#    try:
+#        logger.info(f"Processing message from {sender}: '{message_text}'")
+#        
+#        # Verificar si es un comando manual de recordatorio (prioridad máxima)
+#        if message_text.lower().startswith('/'):
+#            logger.info("Processing as manual command")
+#            return handle_reminder_command(sender, message_text)
+#        
+#        # Obtener o inicializar historial del usuario desde Supabase
+#        chat_history = db_utils.get_chat_history_from_supabase(supabase, sender, limit=20)
+#        
+#        if not chat_history:
+#            chat_history = db_utils.initialize_user_chat(supabase, sender)
+#        
+#        # Guardar mensaje del usuario en Supabase
+#        user_message_id = db_utils.save_message_to_supabase(supabase, sender, "user", message_text)
+#        logger.info(f"User message saved with ID: {user_message_id}")
+#        
+#        # PASO 1: Verificar si es una consulta sobre recordatorios existentes
+#        if reminder_utils.parse_reminder_query(message_text, sender):
+#            logger.info("DETECTED REMINDER QUERY - Listing reminders...")
+#            response = list_user_reminders_intelligent(sender)
+#            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#            return response
+#        
+#        # PASO 2: Verificar si es una solicitud de eliminación de recordatorio específico
+#        reminder_id_to_remove = reminder_utils.parse_reminder_removal(message_text, sender)
+#        if reminder_id_to_remove is not None:
+#            logger.info(f"DETECTED REMINDER REMOVAL REQUEST - Removing reminder {reminder_id_to_remove}...")
+#            success = db_utils.deactivate_reminder_supabase(supabase, sender, reminder_id_to_remove)
+#            
+#            if success:
+#                # Intentar también detener el job en el scheduler
+#                try:
+#                    for job in scheduler.get_jobs():
+#                        if f"_{sender}_{reminder_id_to_remove}" in job.id:
+#                            scheduler.remove_job(job.id)
+#                            logger.info(f"Removed scheduler job for reminder ID {reminder_id_to_remove}")
+#                except Exception as e:
+#                    logger.error(f"Error removing scheduler job: {str(e)}")
+#                
+#                response = f"✅ Recordatorio #{reminder_id_to_remove} eliminado correctamente."
+#            else:
+#                response = f"❌ No pude eliminar el recordatorio con ID {reminder_id_to_remove}. ¿Seguro que es correcto?"
+#            
+#            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#            return response
+#        
+#        # PASO 3: Verificar PRIMERO si es una solicitud de información sobre productos o suplementos
+#        if reminder_utils.is_information_request(message_text) or reminder_utils.is_specific_product_request(message_text):
+#            logger.info("DETECTED INFORMATION REQUEST - Generating AI response...")
+#            
+#            current_history = chat_history.copy()
+#            current_history.append({"role": "user", "content": message_text})
+#            
+#            response = generate_ai_response_with_context(
+#                current_history, 
+#                message_text, 
+#                sender
+#            )
+#            
+#            ai_message_id = db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#            logger.info(f"Generated and saved AI information response")
+#            return response
+#        
+#        # PASO 4: Si contiene palabras clave de recordatorios pero es ambiguo, preguntar para confirmar
+#        if reminder_utils.contains_reminder_keywords(message_text) and not reminder_utils.is_explicit_reminder_request(message_text):
+#            logger.info("AMBIGUOUS REQUEST WITH REMINDER KEYWORDS - Asking for clarification...")
+#            
+#            # Determinar el posible tipo de recordatorio para personalizar la pregunta
+#            possible_type = reminder_utils.detect_reminder_type(message_text.lower())
+#            
+#            if possible_type == "supplement":
+#                response = f"Veo que mencionas suplementos. ¿Quieres que te recomiende información sobre algún suplemento o prefieres que configure un recordatorio para tomarlo? Si deseas un recordatorio, por favor usa '/recordar suplemento [nombre] [frecuencia]'."
+#            elif possible_type == "water":
+#                response = f"Veo que mencionas agua. ¿Quieres que te proporcione información sobre hidratación o prefieres que configure un recordatorio para tomar agua? Si deseas un recordatorio, por favor usa '/recordar agua [frecuencia]'."
+#            else:
+#                response = f"¿Quieres que te proporcione información sobre esto o prefieres que configure un recordatorio? Si deseas un recordatorio, por favor usa '/recordar [tipo] [frecuencia]'."
+#            
+#            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#            return response
+#        
+#        # PASO 5: Verificar si es una solicitud EXPLÍCITA de creación de recordatorio
+#        reminder_info = reminder_utils.parse_reminder_request(message_text, sender)
+#        
+#        if reminder_info and reminder_info.get("detected") and reminder_utils.is_explicit_reminder_request(message_text):
+#            logger.info("DETECTED EXPLICIT REMINDER REQUEST - Creating reminder...")
+#            response = create_intelligent_reminder(sender, reminder_info)
+#            logger.info(f"Reminder creation response: {response}")
+#            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#            return response
+#        
+#        # PASO 6: Procesar como conversación normal
+#        logger.info("No specific intent detected - processing as normal conversation")
+#        
+#        current_history = chat_history.copy()
+#        current_history.append({"role": "user", "content": message_text})
+#        
+#        # Generate AI response with retry mechanism
+#        max_retries = 3
+#        for attempt in range(max_retries):
+#            try:
+#                response = generate_ai_response_with_context(
+#                    current_history, 
+#                    message_text, 
+#                    sender
+#                )
+#                
+#                ai_message_id = db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+#                
+#                if ai_message_id:
+#                    logger.info(f"Generated and saved AI response")
+#                    return response
+#                else:
+#                    logger.error(f"Failed to save AI response for {sender}")
+#                    return response
+#            
+#            except Exception as e:
+#                logger.error(f"Attempt {attempt+1}/{max_retries} failed: {str(e)}")
+#                if attempt == max_retries - 1:
+#                    raise
+#                time.sleep(1)
+#        
+#    except Exception as e:
+#        logger.error(f"Error processing message: {str(e)}")
+#        return "Lo siento, tuve un problema procesando tu mensaje. Por favor intenta de nuevo."
+
+def process_message(sender: str, message_text: str) -> str:
+    """Process a message - VERSIÓN MEJORADA con mejor detección de intención"""
+    try:
+        logger.info(f"Processing message from {sender}: '{message_text}'")
+        
+        # Verificar si es un comando manual de recordatorio (prioridad máxima)
+        if message_text.lower().startswith('/'):
+            logger.info("Processing as manual command")
+            return handle_reminder_command(sender, message_text)
+        
+        # Obtener o inicializar historial del usuario desde Supabase
+        chat_history = db_utils.get_chat_history_from_supabase(supabase, sender, limit=20)
+        
+        if not chat_history:
+            chat_history = db_utils.initialize_user_chat(supabase, sender)
+        
+        # Guardar mensaje del usuario en Supabase
+        user_message_id = db_utils.save_message_to_supabase(supabase, sender, "user", message_text)
+        logger.info(f"User message saved with ID: {user_message_id}")
+        
+        # PASO 1: Verificar si es una consulta sobre recordatorios existentes
+        if reminder_utils.parse_reminder_query(message_text, sender):
+            logger.info("DETECTED REMINDER QUERY - Listing reminders...")
+            response = list_user_reminders_intelligent(sender)
+            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+            return response
+        
+        # PASO 2: Verificar si es una solicitud de eliminación de recordatorio específico
+        reminder_id_to_remove = reminder_utils.parse_reminder_removal(message_text, sender)
+        if reminder_id_to_remove is not None:
+            logger.info(f"DETECTED REMINDER REMOVAL REQUEST - Removing reminder {reminder_id_to_remove}...")
+            success = db_utils.deactivate_reminder_supabase(supabase, sender, reminder_id_to_remove)
+            
+            if success:
+                # Intentar también detener el job en el scheduler
+                try:
+                    for job in scheduler.get_jobs():
+                        if f"_{sender}_{reminder_id_to_remove}" in job.id:
+                            scheduler.remove_job(job.id)
+                            logger.info(f"Removed scheduler job for reminder ID {reminder_id_to_remove}")
+                except Exception as e:
+                    logger.error(f"Error removing scheduler job: {str(e)}")
+                
+                response = f"✅ Recordatorio #{reminder_id_to_remove} eliminado correctamente."
+            else:
+                response = f"❌ No pude eliminar el recordatorio con ID {reminder_id_to_remove}. ¿Seguro que es correcto?"
+            
+            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+            return response
+        
+        # PASO 3: Verificar PRIMERO si es una solicitud de información sobre productos o suplementos
+        if reminder_utils.is_information_request(message_text) or reminder_utils.is_specific_product_request(message_text):
+            logger.info("DETECTED INFORMATION REQUEST - Generating AI response...")
+            
+            current_history = chat_history.copy()
+            current_history.append({"role": "user", "content": message_text})
+            
+            response = generate_ai_response_with_context(
+                current_history, 
+                message_text, 
+                sender
+            )
+            
+            ai_message_id = db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+            logger.info(f"Generated and saved AI information response")
+            return response
+        
+        # PASO 4: Si contiene palabras clave de recordatorios pero es ambiguo, preguntar para confirmar
+        # Versión mejorada para evitar falsos positivos
+        if (reminder_utils.contains_reminder_keywords(message_text) and 
+            not reminder_utils.is_explicit_reminder_request(message_text) and 
+            not reminder_utils.is_information_request(message_text) and
+            not "eliminar" in message_text.lower() and 
+            not "borrar" in message_text.lower() and
+            len(message_text.split()) < 8):  # Mensajes cortos y ambiguos
+            
+            logger.info("AMBIGUOUS REQUEST WITH REMINDER KEYWORDS - Asking for clarification...")
+            
+            # Determinar el posible tipo de recordatorio para personalizar la pregunta
+            possible_type = reminder_utils.detect_reminder_type(message_text.lower())
+            
+            if possible_type == "supplement":
+                response = f"Veo que mencionas suplementos. ¿Quieres que te recomiende información sobre algún suplemento o prefieres que configure un recordatorio para tomarlo? Si deseas un recordatorio, por favor usa '/recordar suplemento [nombre] [frecuencia]'."
+            elif possible_type == "water":
+                response = f"Veo que mencionas agua. ¿Quieres que te proporcione información sobre hidratación o prefieres que configure un recordatorio para tomar agua? Si deseas un recordatorio, por favor usa '/recordar agua [frecuencia]'."
+            else:
+                response = f"¿Quieres que te proporcione información sobre esto o prefieres que configure un recordatorio? Si deseas un recordatorio, por favor usa '/recordar [tipo] [frecuencia]'."
+            
+            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+            return response
+        
+        # PASO 5: Verificar si es una solicitud EXPLÍCITA de creación de recordatorio
+        reminder_info = reminder_utils.parse_reminder_request(message_text, sender)
+        
+        if reminder_info and reminder_info.get("detected") and reminder_utils.is_explicit_reminder_request(message_text):
+            logger.info("DETECTED EXPLICIT REMINDER REQUEST - Creating reminder...")
+            response = create_intelligent_reminder(sender, reminder_info)
+            logger.info(f"Reminder creation response: {response}")
+            db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+            return response
+        
+        # PASO 6: Procesar como conversación normal
+        logger.info("No specific intent detected - processing as normal conversation")
+        
+        current_history = chat_history.copy()
+        current_history.append({"role": "user", "content": message_text})
+        
+        # Generate AI response with retry mechanism
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = generate_ai_response_with_context(
+                    current_history, 
+                    message_text, 
+                    sender
+                )
+                
+                ai_message_id = db_utils.save_message_to_supabase(supabase, sender, "assistant", response)
+                
+                if ai_message_id:
+                    logger.info(f"Generated and saved AI response")
+                    return response
+                else:
+                    logger.error(f"Failed to save AI response for {sender}")
+                    return response
+            
+            except Exception as e:
+                logger.error(f"Attempt {attempt+1}/{max_retries} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(1)
+        
+    except Exception as e:
+        logger.error(f"Error processing message: {str(e)}")
+        return "Lo siento, tuve un problema procesando tu mensaje. Por favor intenta de nuevo."
+
+def generate_ai_response_with_context(chat_history: List[Dict[str, str]], user_message: str, user_phone: str) -> str:
+    """Generate a response using the Google Gemini model with enhanced context."""
+    import google.generativeai as genai
+    
+    genai.configure(api_key=GOOGLE_API_KEY)
+    
+    generation_config = {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 0,
+        "max_output_tokens": 1000,
+    }
+    
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    ]
+    
+#    model = genai.GenerativeModel(
+#        model_name="gemini-2.0-flash",
+#        generation_config=generation_config,
+#        safety_settings=safety_settings,
+#    )
+
+    model = genai.GenerativeModel(
+        model_name="gemini-2.5-flash-preview-05-20", 
+        generation_config=generation_config,
+        safety_settings=safety_settings,
+    )
+    
+    # Format conversation history
+    formatted_history = []
+    for message in chat_history:
+        role = "user" if message["role"] == "user" else "model"
+        formatted_history.append({"role": role, "parts": [message["content"]]})
+    
+    # Obtener estadísticas del usuario para personalización
+    user_stats = db_utils.get_user_stats(supabase, user_phone)
+    active_reminders = db_utils.get_user_reminders_supabase(supabase, user_phone)
+    
+    user_context = ""
+    if user_stats.get("total_messages", 0) > 5:
+        user_context = f"Este usuario ha tenido {user_stats['total_messages']} mensajes contigo, así que ya te conoce."
+    
+    reminders_context = ""
+    if active_reminders:
+        reminder_types = [r['reminder_type'] for r in active_reminders]
+        reminders_context = f"Este usuario tiene {len(active_reminders)} recordatorios activos: {', '.join(reminder_types)}"
+    
+    # Obtener el mensaje del sistema desde el módulo de knowledge_base
+    system_message = knowledge_base.get_system_message(
+        user_context=user_context,
+        reminders_context=reminders_context
+    )
+    
+    formatted_history.insert(0, {"role": "model", "parts": [system_message]})
+    
+    # Generate response
+    chat = model.start_chat(history=formatted_history)
+    response = chat.send_message(user_message)
+    
+    return response.text
+
+#def handle_reminder_command(sender: str, command: str) -> str:
+#    """Manejar comandos manuales de recordatorios"""
+#    command = command.lower().strip()
+#    
+#    if command == '/ayuda' or command == '/help':
+#        return """🤖 *Comandos de Recordatorios:*
+#
+#*Ultra-Flexible (recomendado):*
+#• "Recuérdame tomar agua cada 30 segundos"
+#• "Mi magnesio cada 1.5 horas"
+#• "Recordatorio para dormir a las 10 pm"
+#• "Recuérdame meditar por la mañana"
+#• "¿Qué recordatorios tengo?"
+#• "Elimina recordatorio 3" (para borrar el #3)
+#
+#*Comandos manuales:*
+#• */agua* - Recordatorio de agua cada hora
+#• */dormir* - Recordatorio para dormir a las 10pm
+#• */mis_recordatorios* - Ver recordatorios activos
+#• */borrar_todo* - Detener todos los recordatorios
+#
+#¡Solo dime qué quieres recordar de cualquier forma! 😊"""
+#    
+#    elif command == '/agua':
+#        display_name = "Hidratación Regular"
+#        reminder_id = db_utils.save_reminder_supabase(
+#            supabase=supabase,
+#            user_phone=sender,
+#            reminder_type="water",
+#            message=f"{reminder_utils.REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud.",
+#            display_name=display_name,
+#            interval_minutes=60.0  # Usar float explícitamente
+#        )
+#        
+#        if reminder_id:
+#            scheduler.add_job(
+#                func=send_reminder,
+#                trigger=IntervalTrigger(hours=1),
+#                args=[sender, f"{reminder_utils.REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud."],
+#                id=f"water_{sender}_{reminder_id}",
+#                replace_existing=True
+#            )
+#            return f"💧 ¡Recordatorio de agua activado! Te recordaré cada hora.\n\n🔍 Recordatorio: *{display_name}*"
+#        else:
+#            return "❌ Error al crear recordatorio de agua."
+#    
+#    elif command == '/dormir':
+#        display_name = "Descanso Nocturno"
+#        reminder_id = db_utils.save_reminder_supabase(
+#            supabase=supabase,
+#            user_phone=sender,
+#            reminder_type="sleep",
+#            message=f"{reminder_utils.REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud.",
+#            display_name=display_name,
+#            cron_expression="0 22 * * *"  # 10:00 PM
+#        )
+#        
+#        if reminder_id:
+#            scheduler.add_job(
+#                func=send_reminder,
+#                trigger=CronTrigger(hour=22, minute=0),
+#                args=[sender, f"{reminder_utils.REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud."],
+#                id=f"sleep_{sender}_{reminder_id}",
+#                replace_existing=True
+#            )
+#            return f"😴 ¡Recordatorio para dormir activado! Te avisaré a las 10:00 PM.\n\n🔍 Recordatorio: *{display_name}*"
+#        else:
+#            return "❌ Error al crear recordatorio para dormir."
+#    
+#    elif command == '/meditar':
+#        display_name = "Meditación Diaria"
+#        reminder_id = db_utils.save_reminder_supabase(
+#            supabase=supabase,
+#            user_phone=sender,
+#            reminder_type="meditation",
+#            message=f"{reminder_utils.REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración.",
+#            display_name=display_name,
+#            cron_expression="0 8 * * *"  # 8:00 AM
+#        )
+#        
+#        if reminder_id:
+#            scheduler.add_job(
+#                func=send_reminder,
+#                trigger=CronTrigger(hour=8, minute=0),
+#                args=[sender, f"{reminder_utils.REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración."],
+#                id=f"meditation_{sender}_{reminder_id}",
+#                replace_existing=True
+#            )
+#            return f"🧘 ¡Recordatorio para meditar activado! Te avisaré a las 8:00 AM.\n\n🔍 Recordatorio: *{display_name}*"
+#        else:
+#            return "❌ Error al crear recordatorio para meditar."
+#    
+#    elif command == '/ejercicio':
+#        display_name = "Entrenamiento Diario"
+#        reminder_id = db_utils.save_reminder_supabase(
+#            supabase=supabase,
+#            user_phone=sender,
+#            reminder_type="exercise",
+#            message=f"{reminder_utils.REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día.",
+#            display_name=display_name,
+#            cron_expression="0 17 * * *"  # 5:00 PM
+#        )
+#        
+#        if reminder_id:
+#            scheduler.add_job(
+#                func=send_reminder,
+#                trigger=CronTrigger(hour=17, minute=0),
+#                args=[sender, f"{reminder_utils.REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día."],
+#                id=f"exercise_{sender}_{reminder_id}",
+#                replace_existing=True
+#            )
+#            return f"🏃 ¡Recordatorio para ejercicio activado! Te avisaré a las 5:00 PM.\n\n🔍 Recordatorio: *{display_name}*"
+#        else:
+#            return "❌ Error al crear recordatorio para ejercicio."
+#    
+#    elif command == '/mis_recordatorios':
+#        return list_user_reminders_intelligent(sender)
+#    
+#    elif command == '/borrar_todo' or command == '/stop_todo':
+#        count = db_utils.deactivate_all_reminders_supabase(supabase, sender)
+#        
+#        # También eliminar todos los jobs del scheduler
+#        jobs = scheduler.get_jobs()
+#        scheduler_count = 0
+#        for job in jobs:
+#            if sender in job.id:
+#                scheduler.remove_job(job.id)
+#                scheduler_count += 1
+#        
+#        return f"✅ Se han desactivado {count} recordatorios."
+#    
+#    else:
+#        return "❌ Comando no reconocido. Escribe */ayuda* para ver comandos.\n\n💡 ¡Solo dime qué quieres recordar de forma natural!"
+
+def handle_reminder_command(sender: str, command: str) -> str:
+    """Manejar comandos manuales de recordatorios"""
+    parts = command.lower().strip().split(' ')
+    main_command = parts[0]
+    
+    if main_command == '/ayuda' or main_command == '/help':
+        return """🤖 *Comandos de Recordatorios:*
+
+*Comandos principales:*
+- */recordar agua [frecuencia]* - Recordatorio de agua (ej: "/recordar agua cada 30 minutos")
+- */recordar suplemento [nombre] [frecuencia]* - Recordatorio para suplemento específico
+- */recordar dormir [hora]* - Recordatorio para dormir (ej: "/recordar dormir 22:00")
+- */recordar meditar [frecuencia]* - Recordatorio para meditar
+- */mis_recordatorios* - Ver recordatorios activos
+- */borrar_todo* - Detener todos los recordatorios
+- */borrar [ID]* - Eliminar un recordatorio específico
+
+*Comandos rápidos:*
+- */agua* - Recordatorio de agua cada hora
+- */dormir* - Recordatorio para dormir a las 10pm
+- */meditar* - Recordatorio para meditar cada mañana
+
+Para información sobre suplementos o productos, solo pregunta naturalmente sin usar comandos. 😊"""
+    
+    elif main_command == '/recordar':
+        if len(parts) < 3:
+            return "❌ Formato incorrecto. Ejemplo: */recordar agua cada 30 minutos* o */recordar suplemento magnesio cada 8 horas*"
+        
+        reminder_type = parts[1].lower()
+        
+        if reminder_type == "agua":
+            # Extraer frecuencia del resto del comando
+            frequency_text = ' '.join(parts[2:])
+            interval_minutes = reminder_utils.parse_flexible_frequency(frequency_text)
+            
+            display_name = "Recordatorio de Agua"
+            # No pasamos nickname para agua
+            reminder_id = db_utils.save_reminder_supabase(
+                supabase=supabase,
+                user_phone=sender,
+                reminder_type="water",
+                message=f"{reminder_utils.REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud.",
+                display_name=display_name,
+                interval_minutes=interval_minutes
+            )
+            
+            if reminder_id:
+                scheduler.add_job(
+                    func=send_reminder,
+                    trigger=IntervalTrigger(minutes=interval_minutes),
+                    args=[sender, f"{reminder_utils.REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud."],
+                    id=f"water_{sender}_{reminder_id}",
+                    replace_existing=True
+                )
+                return f"✅ ¡Recordatorio de agua configurado! Te recordaré {reminder_utils.format_interval_text(interval_minutes)}.\n\n🔍 Recordatorio: *{display_name}*"
+            else:
+                return "❌ Error al crear recordatorio de agua."
+                
+        elif reminder_type == "suplemento":
+            if len(parts) < 4:
+                return "❌ Formato incorrecto. Ejemplo: */recordar suplemento magnesio cada 8 horas*"
+            
+            supplement_name = parts[2].title()
+            frequency_text = ' '.join(parts[3:])
+            interval_minutes = reminder_utils.parse_flexible_frequency(frequency_text)
+            
+            display_name = f"Recordatorio de {supplement_name}"
+            
+            try:
+                # Primero intentamos ver si la función acepta nickname
+                reminder_id = db_utils.save_reminder_supabase(
+                    supabase=supabase,
+                    user_phone=sender,
+                    reminder_type="supplement",
+                    message=f"{reminder_utils.REMINDER_EMOJIS['supplement']} Es hora de tomar tu {supplement_name}.",
+                    display_name=display_name,
+                    interval_minutes=interval_minutes,
+                    nickname=supplement_name
+                )
+            except TypeError as e:
+                if "unexpected keyword argument 'nickname'" in str(e):
+                    # Si la función no acepta nickname, llamamos sin ese parámetro
+                    reminder_id = db_utils.save_reminder_supabase(
+                        supabase=supabase,
+                        user_phone=sender,
+                        reminder_type="supplement",
+                        message=f"{reminder_utils.REMINDER_EMOJIS['supplement']} Es hora de tomar tu {supplement_name}.",
+                        display_name=display_name,
+                        interval_minutes=interval_minutes
+                    )
+                else:
+                    raise
+            
+            if reminder_id:
+                scheduler.add_job(
+                    func=send_reminder,
+                    trigger=IntervalTrigger(minutes=interval_minutes),
+                    args=[sender, f"{reminder_utils.REMINDER_EMOJIS['supplement']} Es hora de tomar tu {supplement_name}."],
+                    id=f"supplement_{sender}_{reminder_id}",
+                    replace_existing=True
+                )
+                return f"✅ ¡Recordatorio para {supplement_name} configurado! Te recordaré {reminder_utils.format_interval_text(interval_minutes)}.\n\n🔍 Recordatorio: *{display_name}*"
+            else:
+                return "❌ Error al crear recordatorio de suplemento."
+                
+        elif reminder_type == "dormir":
+            # Extraer hora del resto del comando o usar 22:00 por defecto
+            time_text = ' '.join(parts[2:])
+            times = reminder_utils.parse_flexible_times(time_text)
+            sleep_time = times[0] if times else "22:00"
+            
+            hour, minute = map(int, sleep_time.split(':'))
+            
+            display_name = "Recordatorio para Dormir"
+            # No pasamos nickname para dormir
+            reminder_id = db_utils.save_reminder_supabase(
+                supabase=supabase,
+                user_phone=sender,
+                reminder_type="sleep",
+                message=f"{reminder_utils.REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud.",
+                display_name=display_name,
+                cron_expression=f"{minute} {hour} * * *"
+            )
+            
+            if reminder_id:
+                scheduler.add_job(
+                    func=send_reminder,
+                    trigger=CronTrigger(hour=hour, minute=minute),
+                    args=[sender, f"{reminder_utils.REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud."],
+                    id=f"sleep_{sender}_{reminder_id}",
+                    replace_existing=True
+                )
+                return f"✅ ¡Recordatorio para dormir configurado! Te avisaré a las {sleep_time}.\n\n🔍 Recordatorio: *{display_name}*"
+            else:
+                return "❌ Error al crear recordatorio para dormir."
+                
+        elif reminder_type == "meditar":
+            # Extraer frecuencia del resto del comando o usar hora por defecto
+            frequency_text = ' '.join(parts[2:])
+            
+            # Verificar si es un horario específico o un intervalo
+            if any(word in frequency_text for word in ["a las", ":", "am", "pm", "mañana", "tarde", "noche"]):
+                times = reminder_utils.parse_flexible_times(frequency_text)
+                time_str = times[0] if times else "08:00"  # Por defecto 8am
+                hour, minute = map(int, time_str.split(':'))
+                
+                display_name = "Meditación Diaria"
+                # No pasamos nickname para meditación
+                reminder_id = db_utils.save_reminder_supabase(
+                    supabase=supabase,
+                    user_phone=sender,
+                    reminder_type="meditation",
+                    message=f"{reminder_utils.REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración.",
+                    display_name=display_name,
+                    cron_expression=f"{minute} {hour} * * *"
+                )
+                
+                if reminder_id:
+                    scheduler.add_job(
+                        func=send_reminder,
+                        trigger=CronTrigger(hour=hour, minute=minute),
+                        args=[sender, f"{reminder_utils.REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración."],
+                        id=f"meditation_{sender}_{reminder_id}",
+                        replace_existing=True
+                    )
+                    return f"🧘 ¡Recordatorio para meditar configurado! Te avisaré a las {time_str}.\n\n🔍 Recordatorio: *{display_name}*"
+                else:
+                    return "❌ Error al crear recordatorio para meditar."
+            else:
+                # Es un intervalo
+                interval_minutes = reminder_utils.parse_flexible_frequency(frequency_text)
+                
+                display_name = "Meditación Regular"
+                # No pasamos nickname para meditación
+                reminder_id = db_utils.save_reminder_supabase(
+                    supabase=supabase,
+                    user_phone=sender,
+                    reminder_type="meditation",
+                    message=f"{reminder_utils.REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración.",
+                    display_name=display_name,
+                    interval_minutes=interval_minutes
+                )
+                
+                if reminder_id:
+                    scheduler.add_job(
+                        func=send_reminder,
+                        trigger=IntervalTrigger(minutes=interval_minutes),
+                        args=[sender, f"{reminder_utils.REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración."],
+                        id=f"meditation_{sender}_{reminder_id}",
+                        replace_existing=True
+                    )
+                    return f"🧘 ¡Recordatorio para meditar configurado! Te recordaré {reminder_utils.format_interval_text(interval_minutes)}.\n\n🔍 Recordatorio: *{display_name}*"
+                else:
+                    return "❌ Error al crear recordatorio para meditar."
+        
+        elif reminder_type == "ejercicio":
+            # Extraer frecuencia del resto del comando
+            frequency_text = ' '.join(parts[2:])
+            interval_minutes = reminder_utils.parse_flexible_frequency(frequency_text)
+            
+            display_name = "Entrenamiento Regular"
+            # No pasamos nickname para ejercicio
+            reminder_id = db_utils.save_reminder_supabase(
+                supabase=supabase,
+                user_phone=sender,
+                reminder_type="exercise",
+                message=f"{reminder_utils.REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día.",
+                display_name=display_name,
+                interval_minutes=interval_minutes
+            )
+            
+            if reminder_id:
+                scheduler.add_job(
+                    func=send_reminder,
+                    trigger=IntervalTrigger(minutes=interval_minutes),
+                    args=[sender, f"{reminder_utils.REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día."],
+                    id=f"exercise_{sender}_{reminder_id}",
+                    replace_existing=True
+                )
+                return f"🏃 ¡Recordatorio para ejercicio configurado! Te recordaré {reminder_utils.format_interval_text(interval_minutes)}.\n\n🔍 Recordatorio: *{display_name}*"
+            else:
+                return "❌ Error al crear recordatorio para ejercicio."
+                
+        # Agregar más tipos de recordatorios según sea necesario
+        else:
+            return f"❌ Tipo de recordatorio '{reminder_type}' no reconocido. Prueba con: agua, suplemento, dormir, meditar, ejercicio."
+    
+    elif main_command == '/borrar':
+        if len(parts) < 2:
+            return "❌ Formato incorrecto. Ejemplo: */borrar 3* para eliminar el recordatorio con ID 3."
+        
+        try:
+            reminder_id = int(parts[1])
+            success = db_utils.deactivate_reminder_supabase(supabase, sender, reminder_id)
+            
+            if success:
+                # Intentar también detener el job en el scheduler
+                try:
+                    for job in scheduler.get_jobs():
+                        if f"_{sender}_{reminder_id}" in job.id:
+                            scheduler.remove_job(job.id)
+                            logger.info(f"Removed scheduler job for reminder ID {reminder_id}")
+                except Exception as e:
+                    logger.error(f"Error removing scheduler job: {str(e)}")
+                
+                return f"✅ Recordatorio #{reminder_id} eliminado correctamente."
+            else:
+                return f"❌ No pude eliminar el recordatorio con ID {reminder_id}. ¿Seguro que es correcto?"
+        except ValueError:
+            return "❌ El ID del recordatorio debe ser un número. Ejemplo: */borrar 3*"
+    
+    # Comandos existentes
+    elif main_command == '/agua':
+        display_name = "Hidratación Regular"
+        reminder_id = db_utils.save_reminder_supabase(
+            supabase=supabase,
+            user_phone=sender,
+            reminder_type="water",
+            message=f"{reminder_utils.REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud.",
+            display_name=display_name,
+            interval_minutes=60.0  # Usar float explícitamente
+        )
+        
+        if reminder_id:
+            scheduler.add_job(
+                func=send_reminder,
+                trigger=IntervalTrigger(hours=1),
+                args=[sender, f"{reminder_utils.REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud."],
+                id=f"water_{sender}_{reminder_id}",
+                replace_existing=True
+            )
+            return f"💧 ¡Recordatorio de agua activado! Te recordaré cada hora.\n\n🔍 Recordatorio: *{display_name}*"
+        else:
+            return "❌ Error al crear recordatorio de agua."
+    
+    elif main_command == '/dormir':
+        display_name = "Descanso Nocturno"
+        reminder_id = db_utils.save_reminder_supabase(
+            supabase=supabase,
+            user_phone=sender,
+            reminder_type="sleep",
+            message=f"{reminder_utils.REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud.",
+            display_name=display_name,
+            cron_expression="0 22 * * *"  # 10:00 PM
+        )
+        
+        if reminder_id:
+            scheduler.add_job(
+                func=send_reminder,
+                trigger=CronTrigger(hour=22, minute=0),
+                args=[sender, f"{reminder_utils.REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud."],
+                id=f"sleep_{sender}_{reminder_id}",
+                replace_existing=True
+            )
+            return f"😴 ¡Recordatorio para dormir activado! Te avisaré a las 10:00 PM.\n\n🔍 Recordatorio: *{display_name}*"
+        else:
+            return "❌ Error al crear recordatorio para dormir."
+    
+    elif main_command == '/meditar':
+        display_name = "Meditación Diaria"
+        reminder_id = db_utils.save_reminder_supabase(
+            supabase=supabase,
+            user_phone=sender,
+            reminder_type="meditation",
+            message=f"{reminder_utils.REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración.",
+            display_name=display_name,
+            cron_expression="0 8 * * *"  # 8:00 AM
+        )
+        
+        if reminder_id:
+            scheduler.add_job(
+                func=send_reminder,
+                trigger=CronTrigger(hour=8, minute=0),
+                args=[sender, f"{reminder_utils.REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración."],
+                id=f"meditation_{sender}_{reminder_id}",
+                replace_existing=True
+            )
+            return f"🧘 ¡Recordatorio para meditar activado! Te avisaré a las 8:00 AM.\n\n🔍 Recordatorio: *{display_name}*"
+        else:
+            return "❌ Error al crear recordatorio para meditar."
+    
+    elif main_command == '/ejercicio':
+        display_name = "Entrenamiento Diario"
+        reminder_id = db_utils.save_reminder_supabase(
+            supabase=supabase,
+            user_phone=sender,
+            reminder_type="exercise",
+            message=f"{reminder_utils.REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día.",
+            display_name=display_name,
+            cron_expression="0 17 * * *"  # 5:00 PM
+        )
+        
+        if reminder_id:
+            scheduler.add_job(
+                func=send_reminder,
+                trigger=CronTrigger(hour=17, minute=0),
+                args=[sender, f"{reminder_utils.REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día."],
+                id=f"exercise_{sender}_{reminder_id}",
+                replace_existing=True
+            )
+            return f"🏃 ¡Recordatorio para ejercicio activado! Te avisaré a las 5:00 PM.\n\n🔍 Recordatorio: *{display_name}*"
+        else:
+            return "❌ Error al crear recordatorio para ejercicio."
+    
+    elif main_command == '/mis_recordatorios':
+        return list_user_reminders_intelligent(sender)
+    
+    elif main_command == '/borrar_todo' or main_command == '/stop_todo':
+        count = db_utils.deactivate_all_reminders_supabase(supabase, sender)
+        
+        # También eliminar todos los jobs del scheduler
+        jobs = scheduler.get_jobs()
+        scheduler_count = 0
+        for job in jobs:
+            if sender in job.id:
+                scheduler.remove_job(job.id)
+                scheduler_count += 1
+        
+        return f"✅ Se han desactivado {count} recordatorios."
+    
+    else:
+        return "❌ Comando no reconocido. Escribe */ayuda* para ver comandos disponibles."
+
+#def handle_reminder_command(sender: str, command: str) -> str:
+#    """Manejar comandos manuales de recordatorios"""
+#    parts = command.lower().strip().split(' ')
+#    main_command = parts[0]
+#    
+#    if main_command == '/ayuda' or main_command == '/help':
+#        return """🤖 *Comandos de Recordatorios:*
+#
+#*Comandos principales:*
+#- */recordar agua [frecuencia]* - Recordatorio de agua (ej: "/recordar agua cada 30 minutos")
+#- */recordar suplemento [nombre] [frecuencia]* - Recordatorio para suplemento específico
+#- */recordar dormir [hora]* - Recordatorio para dormir (ej: "/recordar dormir 22:00")
+#- */recordar meditar [frecuencia]* - Recordatorio para meditar
+#- */mis_recordatorios* - Ver recordatorios activos
+#- */borrar_todo* - Detener todos los recordatorios
+#- */borrar [ID]* - Eliminar un recordatorio específico
+#
+#*Comandos rápidos:*
+#- */agua* - Recordatorio de agua cada hora
+#- */dormir* - Recordatorio para dormir a las 10pm
+#- */meditar* - Recordatorio para meditar cada mañana
+#
+#Para información sobre suplementos o productos, solo pregunta naturalmente sin usar comandos. 😊"""
+#    
+#    elif main_command == '/recordar':
+#        if len(parts) < 3:
+#            return "❌ Formato incorrecto. Ejemplo: */recordar agua cada 30 minutos* o */recordar suplemento magnesio cada 8 horas*"
+#        
+#        reminder_type = parts[1].lower()
+#        
+#        if reminder_type == "agua":
+#            # Extraer frecuencia del resto del comando
+#            frequency_text = ' '.join(parts[2:])
+#            interval_minutes = reminder_utils.parse_flexible_frequency(frequency_text)
+#            
+#            display_name = "Recordatorio de Agua"
+#            reminder_id = db_utils.save_reminder_supabase(
+#                supabase=supabase,
+#                user_phone=sender,
+#                reminder_type="water",
+#                message=f"{reminder_utils.REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud.",
+#                display_name=display_name,
+#                interval_minutes=interval_minutes
+#            )
+#            
+#            if reminder_id:
+#                scheduler.add_job(
+#                    func=send_reminder,
+#                    trigger=IntervalTrigger(minutes=interval_minutes),
+#                    args=[sender, f"{reminder_utils.REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud."],
+#                    id=f"water_{sender}_{reminder_id}",
+#                    replace_existing=True
+#                )
+#                return f"✅ ¡Recordatorio de agua configurado! Te recordaré {reminder_utils.format_interval_text(interval_minutes)}.\n\n🔍 Recordatorio: *{display_name}*"
+#            else:
+#                return "❌ Error al crear recordatorio de agua."
+#                
+#        elif reminder_type == "suplemento":
+#            if len(parts) < 4:
+#                return "❌ Formato incorrecto. Ejemplo: */recordar suplemento magnesio cada 8 horas*"
+#            
+#            supplement_name = parts[2].title()
+#            frequency_text = ' '.join(parts[3:])
+#            interval_minutes = reminder_utils.parse_flexible_frequency(frequency_text)
+#            
+#            display_name = f"Recordatorio de {supplement_name}"
+#            reminder_id = db_utils.save_reminder_supabase(
+#                supabase=supabase,
+#                user_phone=sender,
+#                reminder_type="supplement",
+#                message=f"{reminder_utils.REMINDER_EMOJIS['supplement']} Es hora de tomar tu {supplement_name}.",
+#                display_name=display_name,
+#                interval_minutes=interval_minutes,
+#                nickname=supplement_name  # Guardar el nombre específico del suplemento
+#            )
+#            
+#            if reminder_id:
+#                scheduler.add_job(
+#                    func=send_reminder,
+#                    trigger=IntervalTrigger(minutes=interval_minutes),
+#                    args=[sender, f"{reminder_utils.REMINDER_EMOJIS['supplement']} Es hora de tomar tu {supplement_name}."],
+#                    id=f"supplement_{sender}_{reminder_id}",
+#                    replace_existing=True
+#                )
+#                return f"✅ ¡Recordatorio para {supplement_name} configurado! Te recordaré {reminder_utils.format_interval_text(interval_minutes)}.\n\n🔍 Recordatorio: *{display_name}*"
+#            else:
+#                return "❌ Error al crear recordatorio de suplemento."
+#                
+#        elif reminder_type == "dormir":
+#            # Extraer hora del resto del comando o usar 22:00 por defecto
+#            time_text = ' '.join(parts[2:])
+#            times = reminder_utils.parse_flexible_times(time_text)
+#            sleep_time = times[0] if times else "22:00"
+#            
+#            hour, minute = map(int, sleep_time.split(':'))
+#            
+#            display_name = "Recordatorio para Dormir"
+#            reminder_id = db_utils.save_reminder_supabase(
+#                supabase=supabase,
+#                user_phone=sender,
+#                reminder_type="sleep",
+#                message=f"{reminder_utils.REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud.",
+#                display_name=display_name,
+#                cron_expression=f"{minute} {hour} * * *"
+#            )
+#            
+#            if reminder_id:
+#                scheduler.add_job(
+#                    func=send_reminder,
+#                    trigger=CronTrigger(hour=hour, minute=minute),
+#                    args=[sender, f"{reminder_utils.REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud."],
+#                    id=f"sleep_{sender}_{reminder_id}",
+#                    replace_existing=True
+#                )
+#                return f"✅ ¡Recordatorio para dormir configurado! Te avisaré a las {sleep_time}.\n\n🔍 Recordatorio: *{display_name}*"
+#            else:
+#                return "❌ Error al crear recordatorio para dormir."
+#                
+#        # Agregar más tipos de recordatorios según sea necesario
+#        else:
+#            return f"❌ Tipo de recordatorio '{reminder_type}' no reconocido. Prueba con: agua, suplemento, dormir, meditar, ejercicio."
+#    
+#    elif main_command == '/borrar':
+#        if len(parts) < 2:
+#            return "❌ Formato incorrecto. Ejemplo: */borrar 3* para eliminar el recordatorio con ID 3."
+#        
+#        try:
+#            reminder_id = int(parts[1])
+#            success = db_utils.deactivate_reminder_supabase(supabase, sender, reminder_id)
+#            
+#            if success:
+#                # Intentar también detener el job en el scheduler
+#                try:
+#                    for job in scheduler.get_jobs():
+#                        if f"_{sender}_{reminder_id}" in job.id:
+#                            scheduler.remove_job(job.id)
+#                            logger.info(f"Removed scheduler job for reminder ID {reminder_id}")
+#                except Exception as e:
+#                    logger.error(f"Error removing scheduler job: {str(e)}")
+#                
+#                return f"✅ Recordatorio #{reminder_id} eliminado correctamente."
+#            else:
+#                return f"❌ No pude eliminar el recordatorio con ID {reminder_id}. ¿Seguro que es correcto?"
+#        except ValueError:
+#            return "❌ El ID del recordatorio debe ser un número. Ejemplo: */borrar 3*"
+#    
+#    # Mantener los comandos existentes
+#    elif main_command == '/agua':
+#        display_name = "Hidratación Regular"
+#        reminder_id = db_utils.save_reminder_supabase(
+#            supabase=supabase,
+#            user_phone=sender,
+#            reminder_type="water",
+#            message=f"{reminder_utils.REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud.",
+#            display_name=display_name,
+#            interval_minutes=60.0  # Usar float explícitamente
+#        )
+#        
+#        if reminder_id:
+#            scheduler.add_job(
+#                func=send_reminder,
+#                trigger=IntervalTrigger(hours=1),
+#                args=[sender, f"{reminder_utils.REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud."],
+#                id=f"water_{sender}_{reminder_id}",
+#                replace_existing=True
+#            )
+#            return f"💧 ¡Recordatorio de agua activado! Te recordaré cada hora.\n\n🔍 Recordatorio: *{display_name}*"
+#        else:
+#            return "❌ Error al crear recordatorio de agua."
+#    
+#    # ... Mantener los demás comandos existentes ...
+#    
+#    elif main_command == '/mis_recordatorios':
+#        return list_user_reminders_intelligent(sender)
+#    
+#    elif main_command == '/borrar_todo' or main_command == '/stop_todo':
+#        count = db_utils.deactivate_all_reminders_supabase(supabase, sender)
+#        
+#        # También eliminar todos los jobs del scheduler
+#        jobs = scheduler.get_jobs()
+#        scheduler_count = 0
+#        for job in jobs:
+#            if sender in job.id:
+#                scheduler.remove_job(job.id)
+#                scheduler_count += 1
+#        
+#        return f"✅ Se han desactivado {count} recordatorios."
+#    
+#    else:
+#        return "❌ Comando no reconocido. Escribe */ayuda* para ver comandos disponibles."
+
+def initialize_system():
+    """Inicializar sistema completo"""
+    logger.info("Initializing complete system with ULTRA-FLEXIBLE intelligent reminders and DECIMAL support...")
+    
+    if not supabase:
+        logger.warning("Supabase not configured - persistent features will not work")
+        return False
+    
+    try:
+        reminders_test = supabase.table("reminders").select("count", count="exact").execute()
+        chat_test = supabase.table("chat_history").select("count", count="exact").execute()
+        
+        logger.info(f"Connected to Supabase successfully")
+        logger.info(f"Reminders in DB: {reminders_test.count}")
+        logger.info(f"Chat messages in DB: {chat_test.count}")
+        
+        scheduled_count = load_and_schedule_reminders()
+        
+        logger.info(f"System initialized successfully. Scheduled {scheduled_count} reminders.")
+        logger.info("ULTRA-FLEXIBLE reminder parsing with DECIMAL support enabled!")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize system: {str(e)}")
+        return False
+
+# ==================== WHATSAPP INTEGRATION ====================
+
+def send_whatsapp_message(recipient: str, message: str) -> Optional[Dict[str, Any]]:
+    url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
+    
+    payload = {
+        "chatId": f"{recipient}@c.us",
+        "message": message
+    }
+    
+    try:
+        response = requests.post(url, json=payload)
+        response_data = response.json()
+        
+        if response.status_code == 200 and response_data.get("idMessage"):
+            logger.info(f"Message sent to {recipient}: {message[:50]}...")
+        else:
+            logger.error(f"Error sending message: {response_data}")
+        
+        return response_data
+    
+    except Exception as e:
+        logger.error(f"Exception when sending message: {str(e)}")
+        return None
+
+# ==================== ROUTE HANDLERS ====================
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        "status": "online",
+        "message": "Epigen WhatsApp webhook server with ULTRA-FLEXIBLE intelligent reminders and DECIMAL support",
+        "version": "7.0.0",
+        "features": [
+            "AI Chat with Persistent History", 
+            "ULTRA-FLEXIBLE Reminder Detection", 
+            "DECIMAL Interval Support",
+            "Smart Reminder Queries",
+            "Natural Language Processing",
+            "Manual Reminder Commands",
+            "Supabase Integration",
+            "Multiple Reminder Types",
+            "Better Intent Detection",
+            "User-Friendly Reminder Names",
+            "Modular Code Structure"
+        ]
+    }), 200
+
+@app.route('/webhook', methods=['GET', 'POST'])
+def webhook():
+    logger.info(f"Webhook called with method: {request.method}")
+    
+    if request.method == 'GET':
+        logger.info("Received webhook verification request")
+        return jsonify({"status": "webhook is active"}), 200
+    
+    try:
+        raw_data = request.get_data(as_text=True)
+        data = request.get_json()
+        
+        if data.get("typeWebhook") == "incomingMessageReceived":
+            message_data = data.get("messageData", {})
+            
+            if message_data.get("typeMessage") == "textMessage":
+                sender = data["senderData"]["sender"].split("@")[0]
+                message_text = message_data["textMessageData"]["textMessage"]
+                logger.info(f"Received message from {sender}: {message_text}")
+                
+                ai_response = process_message(sender, message_text)
+                logger.info(f"Generated response: {ai_response[:100]}...")
+                
+                send_result = send_whatsapp_message(sender, ai_response)
+                logger.info(f"Send result: {send_result}")
+                
+        return jsonify({"status": "message processed"}), 200
+    
+    except Exception as e:
+        logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    green_api_status = "configured" if GREEN_API_ID and GREEN_API_TOKEN else "not configured"
+    google_api_status = "configured" if GOOGLE_API_KEY else "not configured"
+    supabase_status = "configured" if supabase else "not configured"
+    
+    supabase_stats = {}
+    if supabase:
+        try:
+            reminders_result = supabase.table("reminders").select("count", count="exact").execute()
+            messages_result = supabase.table("chat_history").select("count", count="exact").execute()
+            
+            supabase_stats = {
+                "total_reminders": reminders_result.count,
+                "total_messages": messages_result.count,
+                "connection": "healthy"
+            }
+        except Exception as e:
+            supabase_stats = {
+                "connection": "error",
+                "error": str(e)
+            }
+    
+    return jsonify({
+        "status": "healthy",
+        "timestamp": time.time(),
+        "services": {
+            "green_api": green_api_status,
+            "google_ai": google_api_status,
+            "supabase": supabase_status
+        },
+        "scheduled_jobs": len(scheduler.get_jobs()) if scheduler else 0,
+        "supabase_stats": supabase_stats,
+        "features": {
+            "ultra_flexible_reminders": True,
+            "decimal_interval_support": True,
+            "intelligent_queries": True,
+            "persistent_chat": True,
+            "manual_commands": True,
+            "natural_language_processing": True,
+            "multiple_reminder_types": True,
+            "better_intent_detection": True,
+            "friendly_reminder_names": True,
+            "modular_code_structure": True
+        }
+    }), 200
+
+@app.route('/active_reminders', methods=['GET'])
+def get_active_reminders():
+    try:
+        if not supabase:
+            return jsonify({"status": "error", "message": "Supabase not configured"}), 500
+            
+        result = supabase.table("reminders").select("user_phone, nickname, reminder_type, message, interval_minutes, is_active, created_at").order("created_at", desc=True).limit(20).execute()
+        
+        jobs = scheduler.get_jobs()
+        active_jobs = [{"id": job.id, "next_run": str(job.next_run_time)} for job in jobs]
+        
+        return jsonify({
+            "status": "success",
+            "reminders_in_db": len(result.data) if result.data else 0,
+            "active_jobs": len(active_jobs),
+            "jobs": active_jobs[:10],
+            "reminders": [
+                {
+                    "user": r["user_phone"],
+                    "display_name": r.get("nickname", "Sin nombre"),
+                    "type": r["reminder_type"],
+                    "message": r["message"][:50] + "..." if len(r["message"]) > 50 else r["message"],
+                    "interval": r["interval_minutes"],
+                    "active": r["is_active"],
+                    "created": r["created_at"]
+                } for r in (result.data[:10] if result.data else [])
+            ]
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/chat_stats/<phone>', methods=['GET'])
+def get_chat_stats(phone):
+    try:
+        stats = db_utils.get_user_stats(supabase, phone)
+        recent_messages = db_utils.get_chat_history_from_supabase(supabase, phone, limit=5)
+        active_reminders = db_utils.get_user_reminders_supabase(supabase, phone)
+        
+        return jsonify({
+            "status": "success",
+            "user_phone": phone,
+            "stats": stats,
+            "recent_messages_count": len(recent_messages),
+            "active_reminders_count": len(active_reminders),
+            "reminders": [r["reminder_type"] for r in active_reminders],
+            "reminder_names": [r.get("nickname", "Sin nombre") for r in active_reminders]
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ==================== SERVER STARTUP ====================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    initialize_system()
+    
+    port = int(os.environ.get('PORT', 7860))
+    
+    logger.info(f"Starting server on port {port}")
+    logger.info("🤖 ULTRA-FLEXIBLE Reminder System with DECIMAL Support Ready!")
+    logger.info("Users can now request reminders with precise intervals:")
+    logger.info("  • 'Recuérdame tomar agua cada 30 segundos'")
+    logger.info("  • 'Mi magnesio cada 1.5 horas'")
+    logger.info("  • 'Vitamina D cada 45 minutos'")
+    logger.info("  • 'Recordatorio para dormir a las 10 pm'")
+    logger.info("  • 'Recuérdame meditar por la mañana'")
+    logger.info("  • Y MUCHAS más formas naturales con precisión decimal!")
+    
+    uvicorn.run("app:app", host="0.0.0.0", port=port, interface="wsgi")

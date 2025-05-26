@@ -1,0 +1,961 @@
+"""
+Módulo para manejo de recordatorios, detección de intención y procesamiento de peticiones.
+"""
+import re
+import random
+import time
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+from loguru import logger
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
+
+# ==================== RECORDATORIO EMOJIS Y NOMBRES ====================
+# Mapeo de tipos de recordatorio a emojis para mejor representación visual
+REMINDER_EMOJIS = {
+    "water": "💧",
+    "supplement": "💊",
+    "sleep": "😴",
+    "meditation": "🧘",
+    "exercise": "🏃",
+    "appointment": "📅",
+    "medicine": "🩺",
+    "meal": "🍽️",
+    "custom": "🔔"
+}
+
+# Lista de adjetivos y sustantivos para crear nombres de recordatorio amigables
+REMINDER_ADJECTIVES = [
+    "Diario", "Saludable", "Vital", "Esencial", "Importante", 
+    "Regular", "Renovador", "Personal", "Favorito", "Óptimo"
+]
+
+REMINDER_NOUNS = {
+    "water": ["Agua", "Hidratación", "Líquido"],
+    "supplement": ["Vitamina", "Suplemento", "Nutriente"],
+    "sleep": ["Descanso", "Sueño", "Reposo"],
+    "meditation": ["Meditación", "Calma", "Relajación"],
+    "exercise": ["Ejercicio", "Movimiento", "Actividad"],
+    "appointment": ["Cita", "Compromiso", "Evento"],
+    "medicine": ["Medicina", "Tratamiento", "Remedio"],
+    "meal": ["Comida", "Alimentación", "Nutrición"],
+    "custom": ["Recordatorio", "Aviso", "Notificación"]
+}
+
+def generate_reminder_name(reminder_type: str, supplement_name: str = None) -> str:
+    """Genera un nombre amigable para un recordatorio basado en su tipo"""
+    adjective = random.choice(REMINDER_ADJECTIVES)
+    
+    if reminder_type in REMINDER_NOUNS:
+        noun = random.choice(REMINDER_NOUNS[reminder_type])
+    else:
+        noun = random.choice(REMINDER_NOUNS["custom"])
+    
+    if reminder_type == "supplement" and supplement_name:
+        return f"{adjective} {supplement_name}"
+    else:
+        return f"{adjective} {noun}"
+
+# ==================== FUNCIONES DE DETECCIÓN DE INTENCIÓN ====================
+
+#def is_information_request(text: str) -> bool:
+#    """Detectar si es una pregunta de información en lugar de un recordatorio"""
+#    text_lower = text.lower().strip()
+#    
+#    # Patrones de preguntas informativas
+#    info_patterns = [
+#        # Preguntas directas sobre suplementos, salud, etc.
+#        r"que (?:puedo )?(?:debo )?tomar para",
+#        r"que (?:me )?recomiendas",
+#        r"recomiendame",
+#        r"(?:que|cuales) (?:son|hay|existen) (?:los|las)? (?:mejores|buenos)",
+#        r"(?:que|cual) es (?:bueno|mejor|recomendable)",
+#        r"(?:donde|como) (?:puedo|debo|tengo que)",
+#        r"beneficios de",
+#        r"ventajas de",
+#        r"efectos de",
+#        r"(?:opciones|alternativas) de",
+#        
+#        # Preguntas específicas de salud
+#        r"(?:que|como) (?:puedo|debo) (?:hacer|tomar) para",
+#        r"(?:que|como) (?:me )?ayuda con",
+#        r"(?:que|cual) es (?:bueno|mejor|recomendable) para",
+#        r"que puedo tomar\??$",  # Exactamente "que puedo tomar" con o sin signo
+#        r"para que sirve",
+#        r"como funciona",
+#        r"efectos secundarios",
+#        
+#        # Preguntas sobre productos Epigen
+#        r"test (?:de|para)",
+#        r"prueba (?:de|para)",
+#        r"(?:que|cuales) (?:son|hay|existen) (?:los|las)? (?:test|pruebas)",
+#        r"(?:cuanto|precio|costo) (?:cuesta|vale|es)",
+#        r"donde (?:compro|consigo|adquiero)",
+#        
+#        # Categorías generales
+#        r"^(?:que|quien|cuando|donde|como|por que|porque|cual|cuales|cuanto|cuanta)",
+#        r"me puedes (?:explicar|decir|contar|informar)",
+#        r"informacion (?:sobre|acerca|de)",
+#        r"datos (?:sobre|acerca|de)",
+#    ]
+#    
+#    # Si coincide con algún patrón de pregunta informativa
+#    for pattern in info_patterns:
+#        if re.search(pattern, text_lower):
+#            logger.info(f"Detected information request: '{text}'")
+#            return True
+#    
+#    return False
+
+def is_information_request(text: str) -> bool:
+    """Detectar si es una pregunta de información en lugar de un recordatorio"""
+    text_lower = text.lower().strip()
+    
+    # Palabras específicas de suplementos que indican solicitud de información
+    supplement_info_keywords = [
+        "recomienda", "información", "información sobre", "beneficios", 
+        "efectos", "sirve", "funciona", "mejor", "bueno para", 
+        "ayuda con", "es bueno", "puedo tomar", "debo tomar",
+        "que suplemento", "que me recomiendas", "que tomar para"
+    ]
+    
+    # Verificar primero si hay palabras clave específicas de información sobre suplementos
+    if any(keyword in text_lower for keyword in supplement_info_keywords):
+        return True
+    
+    # Patrones de preguntas informativas
+    info_patterns = [
+        # Preguntas directas sobre suplementos, salud, etc.
+        r"que (?:puedo )?(?:debo )?tomar para",
+        r"que (?:me )?recomiendas",
+        r"recomiendame",
+        r"(?:que|cuales) (?:son|hay|existen) (?:los|las)? (?:mejores|buenos)",
+        r"(?:que|cual) es (?:bueno|mejor|recomendable)",
+        r"(?:donde|como) (?:puedo|debo|tengo que)",
+        r"beneficios de",
+        r"ventajas de",
+        r"efectos de",
+        r"(?:opciones|alternativas) de",
+        
+        # Preguntas específicas de salud
+        r"(?:que|como) (?:puedo|debo) (?:hacer|tomar) para",
+        r"(?:que|como) (?:me )?ayuda con",
+        r"(?:que|cual) es (?:bueno|mejor|recomendable) para",
+        r"que puedo tomar\??$",  # Exactamente "que puedo tomar" con o sin signo
+        r"para que sirve",
+        r"como funciona",
+        r"efectos secundarios",
+        
+        # Preguntas sobre productos Epigen
+        r"test (?:de|para)",
+        r"prueba (?:de|para)",
+        r"(?:que|cuales) (?:son|hay|existen) (?:los|las)? (?:test|pruebas)",
+        r"(?:cuanto|precio|costo) (?:cuesta|vale|es)",
+        r"donde (?:compro|consigo|adquiero)",
+        
+        # Consultas de información genéricas
+        r"me\s*siento",
+        r"tengo\s*(?:problemas|dificultades|síntomas)",
+        r"suplementos?\s*(?:para|de)\s*",
+        r"que\s*suplemento",
+        r"suplementos?$",  # Solo la palabra "suplemento" o "suplementos"
+        
+        # Categorías generales
+        r"^(?:que|quien|cuando|donde|como|por que|porque|cual|cuales|cuanto|cuanta)",
+        r"me puedes (?:explicar|decir|contar|informar)",
+        r"informacion (?:sobre|acerca|de)",
+        r"datos (?:sobre|acerca|de)",
+    ]
+    
+    # Si coincide con algún patrón de pregunta informativa
+    for pattern in info_patterns:
+        if re.search(pattern, text_lower):
+            logger.info(f"Detected information request: '{text}'")
+            return True
+    
+    return False
+
+def is_specific_product_request(text: str) -> bool:
+    """Detectar si es una consulta sobre un producto o suplemento específico"""
+    text_lower = text.lower().strip()
+    
+    # Lista de suplementos y productos comunes
+    supplement_keywords = [
+        "magnesio", "glicinato", "zinc", "vitamina", "omega", "d3", "c", "b12",
+        "ashwagandha", "probiotico", "probiótico", "melatonina", "hierro", "calcio",
+        "selenio", "valeriana", "complejo b", "curcuma", "cúrcuma", "proteína", "proteina",
+        "colágeno", "colageno", "biotina", "creatina", "bcaa", "glutamina", "antioxidante"
+    ]
+    
+    # Lista de productos Epigen
+    epigen_products = [
+        "test", "prueba", "análisis", "analisis", "epigenético", "epigenetico",
+        "diabetes", "intestino", "inflamación", "inflamacion", "peso", "corazón", "corazon"
+    ]
+    
+    # Patrones para detectar consultas de productos
+    product_patterns = [
+        r"(?:donde|como) (?:compro|consigo|adquiero)",
+        r"(?:me )?recomiendas",
+        r"(?:que|cual) es (?:mejor|bueno|recomendable)",
+        r"(?:opciones|alternativas) de",
+        r"donde (?:hay|venden|consigo)",
+        r"(?:puedo|debo) tomar",
+        r"(?:para que|que) (?:sirve|es bueno)",
+        r"beneficios de",
+        r"efectos de",
+        r"información (?:sobre|de)",
+        r"más (?:información|detalles) (?:sobre|de)",
+    ]
+    
+    # Verificar si contiene alguna palabra clave de suplementos o productos
+    has_supplement = any(keyword in text_lower for keyword in supplement_keywords)
+    has_epigen_product = any(keyword in text_lower for keyword in epigen_products)
+    
+    # Verificar si coincide con algún patrón de consulta de producto
+    has_product_pattern = any(re.search(pattern, text_lower) for pattern in product_patterns)
+    
+    # Es una consulta de producto si tiene una palabra clave y un patrón de consulta
+    if (has_supplement or has_epigen_product) and has_product_pattern:
+        logger.info(f"Detected specific product request: '{text}'")
+        return True
+    
+    return False
+
+def parse_flexible_frequency(text: str):
+    """Detectar frecuencia de forma ultra-flexible con soporte decimal completo"""
+    import re
+    
+    # Patrones de tiempo más flexibles con soporte decimal
+    time_patterns = [
+        # Detección de "min" o "minuto" sin número (implica 1 minuto)
+        (r"cada\s*min(?:uto)?s?\b", lambda m: 1),
+        (r"por\s*min(?:uto)?s?\b", lambda m: 1),
+        (r"un\s*min(?:uto)?s?\b", lambda m: 1),
+        (r"1\s*min(?:uto)?s?\b", lambda m: 1),
+
+        # Segundos
+        (r"(\d+(?:\.\d+)?)\s*seg(?:undo)?s?", lambda m: float(m.group(1)) / 60),
+        (r"cada\s*(\d+(?:\.\d+)?)\s*seg(?:undo)?s?", lambda m: float(m.group(1)) / 60),
+        (r"(\d+(?:\.\d+)?)\s*s\b", lambda m: float(m.group(1)) / 60),  # "30s", "15.5s"
+        
+        # Minutos - muchas variaciones con decimales
+        (r"(\d+(?:\.\d+)?)\s*min(?:uto)?s?", lambda m: float(m.group(1))),
+        (r"cada\s*(\d+(?:\.\d+)?)\s*min(?:uto)?s?", lambda m: float(m.group(1))),
+        (r"(\d+(?:\.\d+)?)\s*m\b", lambda m: float(m.group(1))),  # "5m", "2.5m"
+        (r"cada\s*minuto", lambda m: 1),
+        (r"por\s*minuto", lambda m: 1),
+        (r"un\s*minuto", lambda m: 1),
+        (r"1\s*minuto", lambda m: 1),
+        
+        # Fracciones de minuto
+        (r"medio\s*minuto", lambda m: 0.5),
+        (r"30\s*segundos", lambda m: 0.5),
+        (r"15\s*segundos", lambda m: 0.25),
+        (r"45\s*segundos", lambda m: 0.75),
+        
+        # Horas - muchas variaciones con decimales
+        (r"(\d+(?:\.\d+)?)\s*h(?:ora)?s?", lambda m: float(m.group(1)) * 60),
+        (r"cada\s*(\d+(?:\.\d+)?)\s*h(?:ora)?s?", lambda m: float(m.group(1)) * 60),
+        (r"(\d+(?:\.\d+)?)\s*hr?s?", lambda m: float(m.group(1)) * 60),
+        (r"cada\s*hora", lambda m: 60),
+        (r"por\s*hora", lambda m: 60),
+        (r"una\s*hora", lambda m: 60),
+        (r"1\s*hora", lambda m: 60),
+        (r"cada\s*h", lambda m: 60),
+        
+        # Fracciones de hora
+        (r"media\s*hora", lambda m: 30),
+        (r"30\s*min(?:uto)?s?", lambda m: 30),
+        (r"cuarto\s*de\s*hora", lambda m: 15),
+        (r"15\s*min(?:uto)?s?", lambda m: 15),
+        (r"tres\s*cuartos\s*de\s*hora", lambda m: 45),
+        (r"45\s*min(?:uto)?s?", lambda m: 45),
+        
+        # Expresiones más naturales
+        (r"muy\s*seguido", lambda m: 15),  # cada 15 minutos
+        (r"seguido", lambda m: 30),       # cada 30 minutos
+        (r"frecuente", lambda m: 30),
+        (r"constantemente", lambda m: 15),
+        (r"todo\s*el\s*tiempo", lambda m: 10),
+        (r"siempre", lambda m: 30),
+        
+        # Veces por período con decimales
+        (r"dos\s*veces\s*(?:por\s*)?(?:al\s*)?día", lambda m: 12 * 60),    # cada 12 horas
+        (r"tres\s*veces\s*(?:por\s*)?(?:al\s*)?día", lambda m: 8 * 60),     # cada 8 horas
+        (r"cuatro\s*veces\s*(?:por\s*)?(?:al\s*)?día", lambda m: 6 * 60),   # cada 6 horas
+        (r"seis\s*veces\s*(?:por\s*)?(?:al\s*)?día", lambda m: 4 * 60),     # cada 4 horas
+        (r"una\s*vez\s*(?:por\s*)?(?:al\s*)?día", lambda m: 24 * 60),       # cada 24 horas
+        
+        # Números escritos con decimales
+        (r"cada\s*dos\s*h(?:ora)?s?", lambda m: 2 * 60),
+        (r"cada\s*tres\s*h(?:ora)?s?", lambda m: 3 * 60),
+        (r"cada\s*cuatro\s*h(?:ora)?s?", lambda m: 4 * 60),
+        (r"cada\s*cinco\s*h(?:ora)?s?", lambda m: 5 * 60),
+        (r"cada\s*seis\s*h(?:ora)?s?", lambda m: 6 * 60),
+        
+        # Casos especiales comunes
+        (r"a\s*cada\s*rato", lambda m: 30),
+        (r"de\s*vez\s*en\s*cuando", lambda m: 2 * 60),  # cada 2 horas
+        (r"regularmente", lambda m: 60),
+        (r"periódicamente", lambda m: 60),
+    ]
+    
+    # Buscar patrones
+    for pattern, extractor in time_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            result = extractor(match)
+            logger.info(f"Frequency pattern matched: '{pattern}' -> {result} minutes")
+            return result
+    
+    # Default: cada hora
+    logger.info("No specific frequency found, defaulting to 60 minutes")
+    return 60
+
+def parse_flexible_times(text: str):
+    """Detectar horarios de forma ultra-flexible"""
+    import re
+    
+    times_found = []
+    
+    # Patrones de horarios específicos
+    time_patterns = [
+        # Horarios exactos
+        r"(\d{1,2}):(\d{2})",  # 08:30, 14:15
+        r"a\s*las\s*(\d{1,2}):?(\d{2})?",  # a las 8, a las 8:30
+        r"(\d{1,2})\s*(?:am|pm)",  # 8am, 2pm
+        
+        # Expresiones de tiempo
+        r"mañana",
+        r"desayun",
+        r"por\s*la\s*mañana",
+        r"en\s*la\s*mañana",
+        
+        r"mediodía",
+        r"medio\s*día",
+        r"almuerz",
+        r"comer",
+        r"comida",
+        
+        r"tarde",
+        r"por\s*la\s*tarde",
+        r"en\s*la\s*tarde",
+        
+        r"noche",
+        r"por\s*la\s*noche", 
+        r"en\s*la\s*noche",
+        r"cenar",
+        r"cena",
+        r"antes\s*de\s*dormir",
+        r"antes\s*de\s*acostar"
+    ]
+    
+    for pattern in time_patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches:
+            matched_text = match.group().lower()
+            
+            if re.match(r"\d{1,2}:\d{2}", matched_text):
+                times_found.append(matched_text)
+            elif "mañana" in matched_text or "desayun" in matched_text:
+                times_found.append("08:00")
+            elif "mediodía" in matched_text or "almuerz" in matched_text or "comer" in matched_text:
+                times_found.append("12:00")
+            elif "tarde" in matched_text:
+                times_found.append("15:00")
+            elif "noche" in matched_text or "cenar" in matched_text or "dormir" in matched_text or "acostar" in matched_text:
+                times_found.append("20:00")
+            elif re.match(r"a\s*las\s*(\d{1,2})", matched_text):
+                hour_match = re.search(r"(\d{1,2})", matched_text)
+                if hour_match:
+                    hour = int(hour_match.group(1))
+                    times_found.append(f"{hour:02d}:00")
+    
+    # Eliminar duplicados manteniendo el orden
+    unique_times = []
+    for time in times_found:
+        if time not in unique_times:
+            unique_times.append(time)
+    
+    # Si no se encontraron horarios específicos, usar defaults
+    if not unique_times:
+        unique_times = ["08:00", "20:00"]
+    
+    logger.info(f"Times detected: {unique_times}")
+    return unique_times
+
+def detect_reminder_type(text: str):
+    """Detectar el tipo de recordatorio de forma mejorada"""
+    text_lower = text.lower().strip()
+    
+    # Patrones para cada tipo de recordatorio
+    reminder_types = {
+        "water": [
+            "agua", "h2o", "hidrat", "beber", "bebe", "tomar agua", "toma agua",
+            "líquido", "liquido", "fluido", "sed", "hidratar", "hidratarme"
+        ],
+        "sleep": [
+            "dormir", "sueño", "descansar", "descanso", "cama", "acostar", "acuest",
+            "soñar", "hora de dormir", "ir a dormir", "ir a la cama", "hora de descansar"
+        ],
+        "meditation": [
+            "meditar", "meditación", "meditacion", "mindfulness", "respirar", "respira",
+            "relajar", "relaja", "calmar", "calma", "paz", "tranquil", "atencion plena"
+        ],
+        "exercise": [
+            "ejercicio", "entrenar", "entreno", "entrenamient", "gimnasio", "gym", 
+            "correr", "trotar", "caminar", "estirar", "estiramiento", "yoga", "pilates"
+        ],
+        "meal": [
+            "comer", "comida", "almorzar", "almuerzo", "cenar", "cena", "desayunar", 
+            "desayuno", "merienda", "refrigerio", "snack", "alimento"
+        ],
+        "appointment": [
+            "cita", "reunión", "reunion", "consulta", "visita", "médico", "medico", 
+            "doctor", "dentista", "terapia", "fisio", "trabajo", "evento"
+        ]
+    }
+    
+    # Comprobar coincidencias con cada tipo
+    for reminder_type, keywords in reminder_types.items():
+        if any(keyword in text_lower for keyword in keywords):
+            logger.info(f"Detected reminder type: {reminder_type}")
+            return reminder_type
+    
+    # Comprobar si es un medicamento o suplemento
+    supplement_keywords = [
+        "pastilla", "capsula", "tableta", "suplemento", "vitamina", "medicamento", 
+        "píldora", "medicina", "dosis", "tratamiento", "medicación", "medicacion",
+        "cápsula", "remedio", "jarabe", "gotas", "inyección", "inyeccion"
+    ]
+    
+    if any(keyword in text_lower for keyword in supplement_keywords):
+        logger.info(f"Detected reminder type: supplement")
+        return "supplement"
+    
+    # Default a supplement si se menciona un nombre de suplemento específico
+    supplement_names = [
+        "magnesio", "zinc", "selenio", "vitamina", "omega", "hierro", "calcio",
+        "ashwagandha", "probiótico", "melatonina", "b12", "d3", "c", "biotina"
+    ]
+    
+    if any(name in text_lower for name in supplement_names):
+        logger.info(f"Detected supplement name in: {text}")
+        return "supplement"
+    
+    # Si no hay coincidencias claras pero parece un recordatorio, usar tipo personalizado
+    logger.info(f"No specific reminder type detected, using custom type")
+    return "custom"
+
+def parse_flexible_supplement(text: str):
+    """Detectar suplemento/medicamento de forma ultra-flexible con soporte de intervalos"""
+    import re
+    
+    result = {
+        "found": False,
+        "name": "",
+        "times": [],
+        "use_interval": False,  # NUEVO: para detectar si usar intervalo en lugar de horarios
+        "interval_minutes": 60  # NUEVO: intervalo por defecto
+    }
+    
+    # Detectar si se menciona una frecuencia en lugar de horarios específicos
+    frequency_indicators = [
+        "cada", "por", "frecuente", "seguido", "veces", "minuto", "hora", "segundo"
+    ]
+    
+    has_frequency = any(indicator in text.lower() for indicator in frequency_indicators)
+    
+    # Patrones para extraer nombres de suplementos/medicamentos
+    supplement_patterns = [
+        # Formas directas
+        r"(?:tomar|toma|beber|consume|consumir)\s+(?:el\s+|la\s+|mi\s+|mis\s+)?(\w+)",
+        r"(?:recordar|recuerda|recuerdame)\s+(?:que\s+)?(?:tome|tomar|beber|consumir)\s+(?:el\s+|la\s+|mi\s+|mis\s+)?(\w+)",
+        r"(?:quiero|necesito)\s+(?:que\s+me\s+)?(?:recuerdes?)\s+(?:que\s+)?(?:tome|tomar)\s+(?:el\s+|la\s+|mi\s+|mis\s+)?(\w+)",
+        
+        # Con palabras clave específicas
+        r"(?:pastilla|capsula|tableta|suplemento|vitamina|medicamento|medicina|píldora)\s+(?:de\s+)?(\w+)",
+        r"(\w+)\s+(?:pastilla|capsula|tableta|suplemento|vitamina|medicamento|medicina|píldora)",
+        
+        # Formas más naturales
+        r"(?:el|la|mi|mis)\s+(\w+)",  # "mi magnesio", "la vitamina"
+        r"recordatorio\s+(?:para\s+|de\s+)?(?:el\s+|la\s+|mi\s+|mis\s+)?(\w+)",
+    ]
+    
+    # Lista de suplementos/medicamentos comunes para validar
+    valid_supplements = [
+        "magnesio", "vitamina", "omega", "calcio", "hierro", "zinc", "selenio",
+        "b12", "d3", "c", "biotina", "colageno", "colágeno", "probiotico", "probiótico",
+        "melatonina", "ashwagandha", "curcuma", "cúrcuma", "jengibre", "ajo",
+        "metformina", "losartan", "atorvastatina", "omeprazol", "ibuprofeno",
+        "paracetamol", "aspirina", "simvastatina", "enalapril", "metroprolol",
+        "levotiroxina", "insulina", "gabapentina", "lisinopril", "amlodipino"
+    ]
+    
+    for pattern in supplement_patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches:
+            potential_name = match.group(1).lower()
+            
+            # Filtrar palabras que no son suplementos
+            exclude_words = [
+                "agua", "que", "me", "de", "el", "la", "mi", "mis", "un", "una",
+                "recordar", "tomar", "beber", "hora", "horas", "minuto", "minutos",
+                "dia", "día", "noche", "mañana", "tarde", "vez", "veces", "tiempo",
+                "cuando", "donde", "como", "cómo", "para", "por", "con", "sin",
+                "recordatorio", "recordatorios", "medicina", "medicamento", "pastilla"
+            ]
+            
+            if (len(potential_name) >= 3 and 
+                potential_name not in exclude_words and
+                potential_name.isalpha()):
+                
+                # Validar si es un suplemento conocido o si al menos se parece a uno
+                is_valid = (potential_name in valid_supplements or 
+                           any(sup in potential_name for sup in valid_supplements) or
+                           len(potential_name) >= 4)  # Nombres largos probablemente son válidos
+                
+                if is_valid:
+                    result["found"] = True
+                    result["name"] = potential_name.title()
+                    
+                    # NUEVO: Decidir si usar intervalo o horarios específicos
+                    if has_frequency:
+                        result["use_interval"] = True
+                        result["interval_minutes"] = parse_flexible_frequency(text)
+                        logger.info(f"Supplement with interval detected: {result['name']} every {result['interval_minutes']} minutes")
+                    else:
+                        result["use_interval"] = False
+                        result["times"] = parse_flexible_times(text)
+                        logger.info(f"Supplement with specific times detected: {result['name']} at {result['times']}")
+                    
+                    break
+    
+    return result
+
+#def parse_reminder_request(text: str, user_phone: str):
+#    """
+#    VERSIÓN ULTRA-FLEXIBLE MEJORADA: Analizar texto del usuario para extraer información de recordatorios.
+#    Detecta prácticamente cualquier forma de pedir recordatorios con soporte para distintos tipos.
+#    """
+#    text_lower = text.lower().strip()
+#    
+#    # Primero verificamos si es una pregunta informativa en lugar de un recordatorio
+#    if is_information_request(text_lower) and not "recuerd" in text_lower:
+#        logger.info(f"Detected information request rather than reminder: '{text}'")
+#        return None
+#    
+#    # Limpiar texto de signos de puntuación innecesarios
+#    import string
+#    text_clean = text_lower.translate(str.maketrans('', '', '¿¡'))
+#    
+#    logger.info(f"Parsing FLEXIBLE reminder request for {user_phone}: '{text}'")
+#    
+#    # MEGA LISTA de patrones para detectar solicitudes de recordatorio
+#    reminder_patterns = [
+#        # Verbos principales de recordatorio
+#        r"record[aá]r[me]*",
+#        r"recuerd[ae][me]*", 
+#        r"que me recuerdes?",
+#        r"quiero que me recuerdes?",
+#        r"necesito que me recuerdes?",
+#        r"me puedes recordar",
+#        r"puedes recordar[me]*",
+#        r"ayuda[me]* a recordar",
+#        r"ayuda[me]* con recordar",
+#        
+#        # Configuración/programación
+#        r"configur[ae] (?:un )?recordatorio",
+#        r"program[ae] (?:un )?recordatorio", 
+#        r"pon[me]* (?:un )?recordatorio",
+#        r"crea (?:un )?recordatorio",
+#        r"haz (?:un )?recordatorio",
+#        r"activa (?:un )?recordatorio",
+#        r"establece (?:un )?recordatorio",
+#        
+#        # Formas más casuales
+#        r"avisa[me]*",
+#        r"dime cuando",
+#        r"notifica[me]*",
+#        r"alerta[me]*",
+#        r"recuerda[me]* que",
+#        
+#        # Expresiones con "quiero"
+#        r"quiero (?:que )?(?:me )?(?:recuerdes?|recordatorios?)",
+#        r"necesito (?:que )?(?:me )?(?:recuerdes?|recordatorios?)",
+#        r"me gustaria (?:que )?(?:me )?recuerdes?",
+#        r"quisiera (?:que )?(?:me )?recuerdes?",
+#        
+#        # Más variaciones naturales
+#        r"no se me olvide",
+#        r"para no olvidar",
+#        r"que no se me pase",
+#        r"estar al pendiente",
+#        r"mantener[me]* al pendiente",
+#    ]
+#    
+#    # Verificar si es una solicitud de recordatorio
+#    is_reminder_request = False
+#    for pattern in reminder_patterns:
+#        if re.search(pattern, text_clean):
+#            is_reminder_request = True
+#            logger.info(f"Matched pattern: {pattern}")
+#            break
+#    
+#    # También detectar por contexto (palabras relacionadas)
+#    if not is_reminder_request:
+#        context_words = [
+#            "tomar", "toma", "beber", "bebe", "consumir", "consume",
+#            "agua", "hidratar", "hidratarme", "hidratar me",
+#            "pastilla", "pastillas", "capsula", "cápsulas", "tableta", "tabletas",
+#            "suplemento", "suplementos", "vitamina", "vitaminas", "medicamento",
+#            "cada", "a las", "por la", "en la", "todos los", "diario", "diariamente",
+#            "dormir", "meditación", "meditacion", "ejercicio", "entrenar"
+#        ]
+#        
+#        context_matches = sum(1 for word in context_words if word in text_clean)
+#        if context_matches >= 2:  # Si tiene al menos 2 palabras relacionadas
+#            is_reminder_request = True
+#            logger.info(f"Detected by context: {context_matches} context words found")
+#    
+#    if not is_reminder_request:
+#        logger.info(f"No reminder request detected in: '{text}'")
+#        return None
+#    
+#    logger.info(f"FLEXIBLE reminder request detected! Analyzing: '{text}'")
+#    
+#    # Determinar el tipo de recordatorio
+#    reminder_type = detect_reminder_type(text_clean)
+#    
+#    reminder_info = {
+#        "type": reminder_type,
+#        "interval_minutes": 60,  # Default: cada hora
+#        "times": [],
+#        "supplement_name": "",
+#        "message": "",
+#        "detected": True
+#    }
+#    
+#    # Personalizar mensaje y comportamiento según el tipo
+#    if reminder_type == "water":
+#        reminder_info["message"] = f"{REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud."
+#        reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+#        reminder_info["display_name"] = generate_reminder_name("water")
+#        
+#    elif reminder_type == "sleep":
+#        reminder_info["message"] = f"{REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud."
+#        # Los recordatorios de sueño normalmente son a horas específicas
+#        reminder_info["times"] = parse_flexible_times(text_clean)
+#        reminder_info["display_name"] = generate_reminder_name("sleep")
+#        if "22:00" not in reminder_info["times"] and "21:00" not in reminder_info["times"] and "23:00" not in reminder_info["times"]:
+#            reminder_info["times"].append("22:00")  # Añadir 10pm por defecto para recordatorios de sueño
+#        
+#    elif reminder_type == "meditation":
+#        reminder_info["message"] = f"{REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración."
+#        reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+#        reminder_info["display_name"] = generate_reminder_name("meditation")
+#        
+#    elif reminder_type == "exercise":
+#        reminder_info["message"] = f"{REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día."
+#        reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+#        reminder_info["display_name"] = generate_reminder_name("exercise")
+#        
+#    elif reminder_type == "supplement":
+#        supplement_info = parse_flexible_supplement(text_clean)
+#        
+#        if supplement_info["found"]:
+#            reminder_info["supplement_name"] = supplement_info["name"]
+#            reminder_info["message"] = f"{REMINDER_EMOJIS['supplement']} Es hora de tomar tu {supplement_info['name']}"
+#            reminder_info["display_name"] = generate_reminder_name("supplement", supplement_info["name"])
+#            
+#            # Usar intervalo o horarios específicos según lo detectado
+#            if supplement_info["use_interval"]:
+#                reminder_info["interval_minutes"] = supplement_info["interval_minutes"]
+#                reminder_info["times"] = []  # No usar horarios específicos
+#            else:
+#                reminder_info["times"] = supplement_info["times"]
+#                reminder_info["interval_minutes"] = None  # No usar intervalo
+#        else:
+#            # Si no se puede determinar el suplemento específico
+#            reminder_info["supplement_name"] = "suplemento"  # Genérico
+#            reminder_info["message"] = f"{REMINDER_EMOJIS['supplement']} Es hora de tomar tu suplemento"
+#            reminder_info["display_name"] = generate_reminder_name("supplement", "Suplemento")
+#            reminder_info["times"] = parse_flexible_times(text_clean)
+#    
+#    elif reminder_type == "meal":
+#        reminder_info["message"] = f"{REMINDER_EMOJIS['meal']} ¡Es hora de alimentarte! Recuerda comer de forma balanceada."
+#        reminder_info["times"] = ["08:00", "13:00", "19:00"]  # Horarios comunes de comida
+#        reminder_info["display_name"] = generate_reminder_name("meal")
+#        
+#    elif reminder_type == "appointment":
+#        reminder_info["message"] = f"{REMINDER_EMOJIS['appointment']} Recordatorio de tu cita."
+#        reminder_info["times"] = parse_flexible_times(text_clean)
+#        reminder_info["display_name"] = generate_reminder_name("appointment")
+#        
+#    else:  # custom
+#        reminder_info["message"] = f"{REMINDER_EMOJIS['custom']} Recordatorio personalizado"
+#        reminder_info["display_name"] = generate_reminder_name("custom")
+#        # Intentar detectar si es basado en intervalo o en horarios específicos
+#        if any(word in text_clean for word in ["cada", "intervalo", "periódico", "periodico"]):
+#            reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+#        else:
+#            reminder_info["times"] = parse_flexible_times(text_clean)
+#    
+#    logger.info(f"Parsed FLEXIBLE reminder info: {reminder_info}")
+#    return reminder_info
+
+def parse_reminder_request(text: str, user_phone: str):
+    """
+    VERSIÓN MÁS ESTRICTA: Analizar texto del usuario para extraer información de recordatorios.
+    Solo considera solicitudes explícitas de recordatorio.
+    """
+    text_lower = text.lower().strip()
+    
+    # Primero verificamos si es una pregunta informativa en lugar de un recordatorio
+    if is_information_request(text_lower) and not "recuerd" in text_lower:
+        logger.info(f"Detected information request rather than reminder: '{text}'")
+        return None
+    
+    # Verificar si es una solicitud EXPLÍCITA de recordatorio
+    if not is_explicit_reminder_request(text_lower):
+        logger.info(f"Not an explicit reminder request: '{text}'")
+        return None
+    
+    # Limpiar texto de signos de puntuación innecesarios
+    import string
+    text_clean = text_lower.translate(str.maketrans('', '', '¿¡'))
+    
+    logger.info(f"Parsing EXPLICIT reminder request for {user_phone}: '{text}'")
+    
+    # Determinar el tipo de recordatorio
+    reminder_type = detect_reminder_type(text_clean)
+    
+    reminder_info = {
+        "type": reminder_type,
+        "interval_minutes": 60,  # Default: cada hora
+        "times": [],
+        "supplement_name": "",
+        "message": "",
+        "detected": True
+    }
+    
+    # Personalizar mensaje y comportamiento según el tipo
+    if reminder_type == "water":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud."
+        reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+        reminder_info["display_name"] = generate_reminder_name("water")
+        
+    elif reminder_type == "sleep":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud."
+        # Los recordatorios de sueño normalmente son a horas específicas
+        reminder_info["times"] = parse_flexible_times(text_clean)
+        reminder_info["display_name"] = generate_reminder_name("sleep")
+        if "22:00" not in reminder_info["times"] and "21:00" not in reminder_info["times"] and "23:00" not in reminder_info["times"]:
+            reminder_info["times"].append("22:00")  # Añadir 10pm por defecto para recordatorios de sueño
+        
+    elif reminder_type == "meditation":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración."
+        reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+        reminder_info["display_name"] = generate_reminder_name("meditation")
+        
+    elif reminder_type == "exercise":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día."
+        reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+        reminder_info["display_name"] = generate_reminder_name("exercise")
+        
+    elif reminder_type == "supplement":
+        supplement_info = parse_flexible_supplement(text_clean)
+        
+        if supplement_info["found"]:
+            reminder_info["supplement_name"] = supplement_info["name"]
+            reminder_info["message"] = f"{REMINDER_EMOJIS['supplement']} Es hora de tomar tu {supplement_info['name']}"
+            reminder_info["display_name"] = generate_reminder_name("supplement", supplement_info["name"])
+            
+            # Usar intervalo o horarios específicos según lo detectado
+            if supplement_info["use_interval"]:
+                reminder_info["interval_minutes"] = supplement_info["interval_minutes"]
+                reminder_info["times"] = []  # No usar horarios específicos
+            else:
+                reminder_info["times"] = supplement_info["times"]
+                reminder_info["interval_minutes"] = None  # No usar intervalo
+        else:
+            # Si no se puede determinar el suplemento específico
+            reminder_info["supplement_name"] = "suplemento"  # Genérico
+            reminder_info["message"] = f"{REMINDER_EMOJIS['supplement']} Es hora de tomar tu suplemento"
+            reminder_info["display_name"] = generate_reminder_name("supplement", "Suplemento")
+            reminder_info["times"] = parse_flexible_times(text_clean)
+    
+    elif reminder_type == "meal":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['meal']} ¡Es hora de alimentarte! Recuerda comer de forma balanceada."
+        reminder_info["times"] = ["08:00", "13:00", "19:00"]  # Horarios comunes de comida
+        reminder_info["display_name"] = generate_reminder_name("meal")
+        
+    elif reminder_type == "appointment":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['appointment']} Recordatorio de tu cita."
+        reminder_info["times"] = parse_flexible_times(text_clean)
+        reminder_info["display_name"] = generate_reminder_name("appointment")
+        
+    else:  # custom
+        reminder_info["message"] = f"{REMINDER_EMOJIS['custom']} Recordatorio personalizado"
+        reminder_info["display_name"] = generate_reminder_name("custom")
+        # Intentar detectar si es basado en intervalo o en horarios específicos
+        if any(word in text_clean for word in ["cada", "intervalo", "periódico", "periodico"]):
+            reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+        else:
+            reminder_info["times"] = parse_flexible_times(text_clean)
+    
+    logger.info(f"Parsed EXPLICIT reminder info: {reminder_info}")
+    return reminder_info
+
+def parse_reminder_query(text: str, user_phone: str):
+    """Detectar consultas sobre recordatorios existentes - VERSIÓN ULTRA-FLEXIBLE"""
+    text_lower = text.lower().strip()
+    
+    # Patrones ultra-flexibles para consultas
+    query_patterns = [
+        # Preguntas directas
+        r"que\s*recordatorios?\s*tengo",
+        r"cuales?\s*son\s*mis\s*recordatorios?",
+        r"mis\s*recordatorios?",
+        r"ver\s*recordatorios?",
+        r"recordatorios?\s*activos?",
+        r"tengo\s*recordatorios?",
+        r"cuantos?\s*recordatorios?",
+        r"lista\s*de\s*recordatorios?",
+        
+        # Variaciones más naturales
+        r"que\s*(?:me\s*)?(?:estas\s*)?recordando",
+        r"de\s*que\s*(?:me\s*)?(?:tienes\s*que\s*)?recordar",
+        r"que\s*(?:tienes\s*)?(?:programado|configurado)",
+        r"mostrar\s*recordatorios?",
+        r"enseñar\s*recordatorios?",
+        r"dime\s*(?:que\s*)?recordatorios?",
+        r"cuales?\s*recordatorios?",
+        
+        # Con palabras interrogativas
+        r"(?:que|cuales?|cuantos?)\s*.*recordatorios?",
+        r"recordatorios?\s*(?:que\s*)?(?:tengo|hay|existen)",
+        
+        # Formas muy casuales
+        r"recordatorios?\?",
+        r"que\s*hay\s*programado",
+        r"que\s*tienes\s*para\s*mi",
+        r"que\s*me\s*vas\s*a\s*recordar",
+        
+        # Con errores tipográficos comunes
+        r"recordatroios?",
+        r"recrodatorios?",
+        r"recordarios?",
+    ]
+    
+    is_query = any(re.search(pattern, text_lower) for pattern in query_patterns)
+    
+    if is_query:
+        logger.info(f"FLEXIBLE reminder query detected for {user_phone}: '{text}'")
+        return True
+    
+    return False
+
+def parse_reminder_removal(text: str, user_phone: str):
+    """Detectar solicitudes de eliminación de recordatorios específicos"""
+    text_lower = text.lower().strip()
+    
+    # Patrones para eliminar recordatorios específicos
+    removal_patterns = [
+        # Por ID
+        r"(?:elimina|borra|quita|remueve|cancela|detén|detene|para|parar)\s+(?:el\s+)?recordatorio\s+(?:con\s+)?(?:id\s+|#)?(\d+)",
+        r"(?:eliminar|borrar|quitar|remover|cancelar|detener|parar)\s+(?:el\s+)?recordatorio\s+(?:con\s+)?(?:id\s+|#)?(\d+)",
+        r"(?:ya\s+)?no\s+(?:me\s+)?recuerdes\s+(?:el\s+)?(?:recordatorio\s+)?(?:con\s+)?(?:id\s+|#)?(\d+)",
+        r"recordatorio\s+(?:con\s+)?(?:id\s+|#)?(\d+)\s+(?:eliminalo|borralo|quitalo|cancelalo)",
+        
+        # Por número en la lista
+        r"(?:elimina|borra|quita|remueve|cancela|detén|detene|para|parar)\s+(?:el\s+)?recordatorio\s+(?:número\s+|#)?(\d+)",
+        r"(?:eliminar|borrar|quitar|remover|cancelar|detener|parar)\s+(?:el\s+)?recordatorio\s+(?:número\s+|#)?(\d+)",
+        
+        # Directamente el número
+        r"(?:elimina|borra|quita|remueve|cancela|detén|detene|para|parar|eliminar|borrar|quitar|remover|cancelar|detener|parar)\s+(?:el\s+)?(\d+)",
+        r"(?:elimina|borra|quita|remueve|cancela|detén|detene|para|parar|eliminar|borrar|quitar|remover|cancelar|detener|parar)\s+recordatorio\s+(\d+)",
+    ]
+    
+    for pattern in removal_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            reminder_id = int(match.group(1))
+            logger.info(f"Detected reminder removal request for ID {reminder_id}")
+            return reminder_id
+    
+    return None
+
+def format_interval_text(interval_minutes: float) -> str:
+    """Formatear texto de intervalo de forma legible"""
+    if interval_minutes < 1:
+        seconds = int(interval_minutes * 60)
+        return f"cada {seconds} segundos"
+    elif interval_minutes == 1:
+        return "cada minuto"
+    elif interval_minutes < 60:
+        if interval_minutes == int(interval_minutes):
+            return f"cada {int(interval_minutes)} minutos"
+        else:
+            return f"cada {interval_minutes} minutos"
+    else:
+        hours = interval_minutes / 60
+        if hours == int(hours):
+            return f"cada {int(hours)} horas"
+        else:
+            return f"cada {round(hours, 1)} horas"
+
+#def contains_reminder_keywords(text: str) -> bool:
+#    """Detectar si el texto contiene palabras clave relacionadas con recordatorios"""
+#    text_lower = text.lower().strip()
+#    
+#    reminder_keywords = [
+#        "recordar", "recordatorio", "avisar", "notificar", "programar",
+#        "agua", "suplemento", "vitamina", "pastilla", "medicamento", 
+#        "dormir", "sueño", "descanso", "meditar", "ejercicio"
+#    ]
+#    
+#    return any(keyword in text_lower for keyword in reminder_keywords)
+def contains_reminder_keywords(text: str) -> bool:
+    """Detectar si el texto contiene palabras clave relacionadas con recordatorios"""
+    text_lower = text.lower().strip()
+    
+    # Lista más acotada de palabras clave de recordatorio (eliminando suplementos específicos)
+    reminder_keywords = [
+        "recordar", "recordatorio", "avisar", "notificar", "programar", 
+        "recordarme", "recuérdame", "avísame", "notifícame", "programa"
+    ]
+    
+    # Palabras clave secundarias (requieren al menos una palabra primaria)
+    secondary_keywords = [
+        "agua", "tomar", "dormir", "meditar", "ejercicio"
+    ]
+    
+    # Si tiene al menos una palabra clave principal
+    has_primary = any(keyword in text_lower for keyword in reminder_keywords)
+    
+    # Si tiene palabras secundarias sin primarias, no es un recordatorio
+    if not has_primary and any(keyword in text_lower for keyword in secondary_keywords):
+        return False
+        
+    return has_primary
+
+def is_explicit_reminder_request(text: str) -> bool:
+    """Detectar si el mensaje es una solicitud explícita de recordatorio"""
+    text_lower = text.lower().strip()
+    
+    explicit_patterns = [
+        r"recuerda(?:me)?",
+        r"(?:quiero|necesito) (?:un )?recordatorio",
+        r"configura(?:me)? (?:un )?recordatorio",
+        r"crea(?:me)? (?:un )?recordatorio",
+        r"(?:quiero|necesito) que me recuerdes",
+        r"ayuda(?:me)? a recordar",
+        r"programa(?:me)? (?:un )?recordatorio",
+        r"establece(?:me)? (?:un )?recordatorio"
+    ]
+    
+    return any(re.search(pattern, text_lower) for pattern in explicit_patterns)

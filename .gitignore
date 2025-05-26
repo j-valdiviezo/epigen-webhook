@@ -32,3 +32,6 @@ venv/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+##
+ngrok_recovery_codes.txt

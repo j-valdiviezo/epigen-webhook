@@ -10,3 +10,9 @@ google-generativeai   # Google's Gemini AI API client
 # Utilities
 pydantic              # Data validation library
 loguru                # Better logging capabilities
+
+# Scheduler 
+APScheduler
+pytz
+supabase
+postgrest

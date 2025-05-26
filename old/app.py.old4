@@ -1,0 +1,1076 @@
+"""
+WhatsApp Webhook Server for Epigen Chatbot with Smart Reminders
+This server receives webhook events from WhatsApp via Green API,
+processes them using Google's Gemini AI model, and sends responses
+back to the user. Features intelligent reminder setup and persistent chat history.
+"""
+import os
+import json
+import time
+import sys
+import re
+from typing import Dict, List, Any, Optional
+import requests
+from flask import Flask, request, jsonify
+from loguru import logger
+from dotenv import load_dotenv
+
+# Imports para recordatorios
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
+from datetime import datetime, timedelta
+import pytz
+import atexit
+from supabase import create_client, Client
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Flask application
+app = Flask(__name__)
+
+# ==================== CONFIGURATION ====================
+# Get API credentials from environment variables
+GREEN_API_ID = os.environ.get("GREEN_API_ID")
+GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+
+# Supabase configuration
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
+logger.info(f"GREEN_API_ID={GREEN_API_ID}, GREEN_API_TOKEN={GREEN_API_TOKEN}")
+logger.info(f"SUPABASE_URL={SUPABASE_URL}")
+
+# Check if required environment variables are set
+if not GREEN_API_ID or not GREEN_API_TOKEN:
+    logger.warning("WhatsApp API credentials not set. Webhook will not be able to send messages.")
+if not GOOGLE_API_KEY:
+    logger.warning("Google API key not set. AI responses will not work.")
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    logger.warning("Supabase credentials not set. Reminders will not work.")
+
+# Configure logging
+logger.remove()
+logger.add(sys.stdout, level="INFO")
+
+# ==================== REMINDERS SETUP ====================
+# Initialize Supabase client
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_ANON_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+# Initialize scheduler
+scheduler = BackgroundScheduler(timezone=pytz.timezone('America/Mexico_City'))
+scheduler.start()
+
+# Ensure scheduler shuts down properly
+atexit.register(lambda: scheduler.shutdown())
+
+# ==================== KNOWLEDGE BASE ====================
+knowledge_product = """
+[Tu knowledge_product original - mantengo la estructura pero no copio todo por espacio]
+Te compartimos los enlaces directos de los suplementos que recomendamos...
+"""
+
+knowledge_content = """
+[Tu knowledge_content original - mantengo la estructura pero no copio todo por espacio]
+# Datos de Epigen
+- WhatsApp: 5544918977
+- Direccion: Avenida de los Insurgentes 601, 03810 Col. Nápoles, CDMX, CP:03100
+- Sitio Web: https://epigen.mx/
+...
+"""
+
+# ==================== SUPABASE CHAT HISTORY FUNCTIONS ====================
+
+def save_message_to_supabase(user_phone: str, role: str, content: str, session_id: str = None):
+    """Guardar mensaje en el historial de Supabase"""
+    if not supabase:
+        logger.error("Supabase not initialized")
+        return None
+        
+    try:
+        # Obtener el próximo número de orden para este usuario
+        result = supabase.table("chat_history").select("message_order").eq("user_phone", user_phone).order("message_order", desc=True).limit(1).execute()
+        
+        next_order = 1
+        if result.data:
+            next_order = result.data[0]["message_order"] + 1
+        
+        # Preparar datos del mensaje
+        message_data = {
+            "user_phone": user_phone,
+            "role": role,
+            "content": content,
+            "message_order": next_order,
+            "session_id": session_id or f"session_{user_phone}_{int(time.time())}"
+        }
+        
+        # Insertar mensaje
+        insert_result = supabase.table("chat_history").insert(message_data).execute()
+        
+        if insert_result.data:
+            logger.info(f"Message saved for {user_phone}: {role} - {content[:50]}...")
+            return insert_result.data[0]["id"]
+        else:
+            logger.error(f"Failed to save message: {insert_result}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error saving message to Supabase: {str(e)}")
+        return None
+
+def get_chat_history_from_supabase(user_phone: str, limit: int = 20):
+    """Obtener historial de chat desde Supabase"""
+    if not supabase:
+        return []
+        
+    try:
+        # Obtener los últimos mensajes del usuario, ordenados por message_order
+        result = supabase.table("chat_history").select("role, content, timestamp, message_order").eq("user_phone", user_phone).order("message_order", desc=True).limit(limit).execute()
+        
+        if result.data:
+            # Invertir el orden para tener los mensajes más antiguos primero
+            messages = result.data[::-1]
+            
+            # Convertir al formato esperado por el AI
+            formatted_history = []
+            for msg in messages:
+                formatted_history.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            
+            logger.info(f"Loaded {len(formatted_history)} messages for {user_phone}")
+            return formatted_history
+        else:
+            logger.info(f"No chat history found for {user_phone}")
+            return []
+            
+    except Exception as e:
+        logger.error(f"Error loading chat history from Supabase: {str(e)}")
+        return []
+
+def initialize_user_chat(user_phone: str):
+    """Inicializar chat para nuevo usuario"""
+    # Verificar si el usuario ya tiene historial
+    existing_history = get_chat_history_from_supabase(user_phone, limit=1)
+    
+    if not existing_history:
+        # Usuario nuevo, crear mensaje de bienvenida
+        welcome_message = "¡Hola! Soy Noa, tu asistente personal de Epigen. ¿Cómo puedo ayudarte hoy? 🧬\n\nTambién puedo configurar recordatorios automáticamente. Solo dime qué quieres recordar y yo me encargo del resto."
+        
+        save_message_to_supabase(user_phone, "assistant", welcome_message)
+        logger.info(f"Initialized new chat for {user_phone}")
+        
+        return [{"role": "assistant", "content": welcome_message}]
+    else:
+        return existing_history
+
+def get_user_stats(user_phone: str):
+    """Obtener estadísticas del usuario"""
+    if not supabase:
+        return {}
+        
+    try:
+        # Contar mensajes del usuario
+        message_count_result = supabase.table("chat_history").select("id", count="exact").eq("user_phone", user_phone).execute()
+        
+        # Obtener primer y último mensaje
+        first_message_result = supabase.table("chat_history").select("created_at").eq("user_phone", user_phone).order("message_order", desc=False).limit(1).execute()
+        
+        last_message_result = supabase.table("chat_history").select("created_at").eq("user_phone", user_phone).order("message_order", desc=True).limit(1).execute()
+        
+        stats = {
+            "total_messages": message_count_result.count or 0,
+            "first_interaction": first_message_result.data[0]["created_at"] if first_message_result.data else None,
+            "last_interaction": last_message_result.data[0]["created_at"] if last_message_result.data else None
+        }
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error getting user stats: {str(e)}")
+        return {}
+
+# ==================== SUPABASE REMINDERS FUNCTIONS ====================
+
+def save_reminder_supabase(user_phone: str, reminder_type: str, message: str, 
+                          interval_minutes: int = None, cron_expression: str = None):
+    """Guardar recordatorio en Supabase"""
+    if not supabase:
+        logger.error("Supabase not initialized")
+        return None
+        
+    try:
+        data = {
+            "user_phone": user_phone,
+            "reminder_type": reminder_type,
+            "message": message,
+            "interval_minutes": interval_minutes,
+            "cron_expression": cron_expression,
+            "is_active": True,
+            "timezone": "America/Mexico_City"
+        }
+        
+        result = supabase.table("reminders").insert(data).execute()
+        
+        if result.data:
+            logger.info(f"Reminder saved for {user_phone}: {reminder_type}")
+            return result.data[0]["id"]
+        else:
+            logger.error(f"Failed to save reminder: {result}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error saving reminder to Supabase: {str(e)}")
+        return None
+
+def get_user_reminders_supabase(user_phone: str):
+    """Obtener recordatorios de un usuario específico"""
+    if not supabase:
+        return []
+        
+    try:
+        result = supabase.table("reminders").select("*").eq("user_phone", user_phone).eq("is_active", True).execute()
+        
+        if result.data:
+            return result.data
+        else:
+            return []
+            
+    except Exception as e:
+        logger.error(f"Error getting user reminders: {str(e)}")
+        return []
+
+def deactivate_reminder_supabase(user_phone: str, reminder_type: str):
+    """Desactivar recordatorios de un tipo específico para un usuario"""
+    if not supabase:
+        return False
+        
+    try:
+        result = supabase.table("reminders").update({"is_active": False}).eq("user_phone", user_phone).eq("reminder_type", reminder_type).execute()
+        
+        if result.data:
+            logger.info(f"Deactivated {reminder_type} reminders for {user_phone}")
+            return True
+        else:
+            logger.warning(f"No reminders found to deactivate for {user_phone}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error deactivating reminder: {str(e)}")
+        return False
+
+def load_reminders_supabase():
+    """Cargar todos los recordatorios activos desde Supabase"""
+    if not supabase:
+        return []
+        
+    try:
+        result = supabase.table("reminders").select("*").eq("is_active", True).execute()
+        
+        if result.data:
+            logger.info(f"Loaded {len(result.data)} active reminders from Supabase")
+            return result.data
+        else:
+            logger.info("No active reminders found in Supabase")
+            return []
+            
+    except Exception as e:
+        logger.error(f"Error loading reminders from Supabase: {str(e)}")
+        return []
+
+# ==================== INTELLIGENT REMINDER FUNCTIONS ====================
+
+def send_reminder(user_phone: str, message: str):
+    """Enviar un mensaje de recordatorio"""
+    try:
+        send_result = send_whatsapp_message(user_phone, f"🔔 {message}")
+        logger.info(f"Reminder sent to {user_phone}: {message}")
+        return send_result
+    except Exception as e:
+        logger.error(f"Error sending reminder to {user_phone}: {str(e)}")
+        return None
+
+ 
+
+
+
+
+
+
+
+
+
+
+# ==================== FIXED INTELLIGENT REMINDER FUNCTIONS ====================
+
+def parse_reminder_request(text: str, user_phone: str):
+    """
+    Analizar texto del usuario para extraer información de recordatorios.
+    Versión corregida con más logging.
+    """
+    text_lower = text.lower()
+    logger.info(f"Parsing reminder request for {user_phone}: '{text}'")
+    
+    # Patrones para detectar solicitudes de recordatorio - versión más simple
+    reminder_keywords = [
+        "recordar", "recuerda", "recuerdame", "recordatorio",
+        "que me recuerdes", "quiero que me recuerdes",
+        "configura", "programa", "pon un recordatorio"
+    ]
+    
+    # Verificar si es una solicitud de recordatorio
+    is_reminder_request = any(keyword in text_lower for keyword in reminder_keywords)
+    
+    if not is_reminder_request:
+        logger.info(f"No reminder request detected in: '{text}'")
+        return None
+    
+    logger.info(f"Reminder request detected! Analyzing: '{text}'")
+    
+    reminder_info = {
+        "type": "unknown",
+        "interval_minutes": 60,  # Default: cada hora
+        "times": [],
+        "supplement_name": "",
+        "message": "",
+        "detected": True
+    }
+    
+    # Detectar tipo de recordatorio
+    if any(word in text_lower for word in ["agua", "hidratar", "beber"]):
+        reminder_info["type"] = "water"
+        reminder_info["message"] = "💧 ¡Es hora de tomar agua! Mantente hidratado para tu salud."
+        
+        # Buscar frecuencia específica
+        if "minuto" in text_lower:
+            if "cada minuto" in text_lower:
+                reminder_info["interval_minutes"] = 1
+            elif "30 segundos" in text_lower:
+                reminder_info["interval_minutes"] = 0.5  # 30 segundos
+            else:
+                # Buscar números antes de "minuto"
+                import re
+                minute_match = re.search(r"(\d+)\s*minutos?", text_lower)
+                if minute_match:
+                    reminder_info["interval_minutes"] = int(minute_match.group(1))
+        elif "hora" in text_lower:
+            hour_match = re.search(r"(\d+)\s*horas?", text_lower)
+            if hour_match:
+                reminder_info["interval_minutes"] = int(hour_match.group(1)) * 60
+            else:
+                reminder_info["interval_minutes"] = 60  # cada hora por defecto
+    
+    else:
+        # Buscar nombre del suplemento
+        supplement_patterns = [
+            r"recordar(?:me)? (?:tomar|toma) (\w+)",
+            r"recuerdes? (?:tomar|toma) (\w+)",
+        ]
+        
+        supplement_name = ""
+        for pattern in supplement_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                supplement_name = match.group(1).title()
+                break
+        
+        if supplement_name and supplement_name.lower() not in ["agua", "que", "me", "de", "el", "la"]:
+            reminder_info["type"] = "supplement"
+            reminder_info["supplement_name"] = supplement_name
+            reminder_info["message"] = f"💊 Es hora de tomar tu {supplement_name}"
+            reminder_info["times"] = ["08:00", "20:00"]  # Default times
+        else:
+            # Si no se puede determinar el suplemento, tratar como agua
+            reminder_info["type"] = "water"
+            reminder_info["message"] = "💧 ¡Es hora de tomar agua! Mantente hidratado para tu salud."
+    
+    logger.info(f"Parsed reminder info: {reminder_info}")
+    return reminder_info
+
+def create_intelligent_reminder(user_phone: str, reminder_info: dict):
+    """Crear recordatorio basado en la información extraída inteligentemente"""
+    logger.info(f"Creating intelligent reminder for {user_phone}: {reminder_info}")
+    
+    try:
+        if reminder_info["type"] == "water":
+            # Crear recordatorio de agua
+            interval_minutes = int(reminder_info["interval_minutes"])
+            
+            logger.info(f"Creating water reminder: {interval_minutes} minutes interval")
+            
+            reminder_id = save_reminder_supabase(
+                user_phone=user_phone,
+                reminder_type="water",
+                message=reminder_info["message"],
+                interval_minutes=interval_minutes
+            )
+            
+            logger.info(f"Supabase save result: reminder_id = {reminder_id}")
+            
+            if reminder_id:
+                # Programar en scheduler
+                try:
+                    job = scheduler.add_job(
+                        func=send_reminder,
+                        trigger=IntervalTrigger(minutes=interval_minutes),
+                        args=[user_phone, reminder_info["message"]],
+                        id=f"water_{user_phone}_{reminder_id}",
+                        replace_existing=True
+                    )
+                    logger.info(f"Scheduler job created: {job.id}")
+                except Exception as scheduler_error:
+                    logger.error(f"Scheduler error: {scheduler_error}")
+                    return f"❌ Error al programar recordatorio: {scheduler_error}"
+                
+                if interval_minutes < 1:
+                    freq_text = f"cada {int(interval_minutes * 60)} segundos"
+                elif interval_minutes == 1:
+                    freq_text = "cada minuto"
+                elif interval_minutes < 60:
+                    freq_text = f"cada {interval_minutes} minutos"
+                else:
+                    hours = interval_minutes // 60
+                    freq_text = f"cada {hours} horas"
+                    
+                return f"✅ ¡Perfecto! He configurado tu recordatorio de agua {freq_text}.\n\n💧 Te voy a recordar mantenerte hidratado regularmente."
+            else:
+                logger.error("Failed to save reminder to Supabase")
+                return "❌ Error al guardar recordatorio en la base de datos."
+            
+        elif reminder_info["type"] == "supplement":
+            # Crear recordatorio de suplemento
+            supplement_name = reminder_info["supplement_name"]
+            times = reminder_info["times"]
+            
+            created_count = 0
+            for time_str in times:
+                try:
+                    hour, minute = map(int, time_str.split(':'))
+                    
+                    reminder_id = save_reminder_supabase(
+                        user_phone=user_phone,
+                        reminder_type="supplement",
+                        message=f"💊 Es hora de tomar tu {supplement_name}",
+                        cron_expression=f"{minute} {hour} * * *"
+                    )
+                    
+                    if reminder_id:
+                        scheduler.add_job(
+                            func=send_reminder,
+                            trigger=CronTrigger(hour=hour, minute=minute),
+                            args=[user_phone, f"💊 Es hora de tomar tu {supplement_name}"],
+                            id=f"supplement_{supplement_name}_{user_phone}_{reminder_id}",
+                            replace_existing=True
+                        )
+                        created_count += 1
+                        
+                except Exception as e:
+                    logger.error(f"Error creating supplement reminder: {str(e)}")
+                    continue
+            
+            if created_count > 0:
+                times_text = ", ".join(times)
+                return f"✅ ¡Listo! He configurado tu recordatorio para {supplement_name} a las {times_text}.\n\n💊 Te recordaré tomarlo puntualmente."
+        
+        logger.error("No valid reminder type found")
+        return "❌ No pude configurar el recordatorio. Inténtalo de nuevo con más detalles."
+        
+    except Exception as e:
+        logger.error(f"Error creating intelligent reminder: {str(e)}")
+        return f"❌ Hubo un error al configurar el recordatorio: {str(e)}"
+
+# ==================== UPDATED MESSAGE PROCESSING ====================
+
+def process_message(sender: str, message_text: str) -> str:
+    """
+    Process a message - VERSIÓN CORREGIDA
+    """
+    try:
+        logger.info(f"Processing message from {sender}: '{message_text}'")
+        
+        # Verificar si es un comando manual de recordatorio
+        if message_text.lower().startswith('/'):
+            logger.info("Processing as manual command")
+            return handle_reminder_command(sender, message_text)
+        
+        # Obtener o inicializar historial del usuario desde Supabase
+        chat_history = get_chat_history_from_supabase(sender, limit=20)
+        
+        if not chat_history:
+            # Usuario nuevo, inicializar
+            chat_history = initialize_user_chat(sender)
+        
+        # Guardar mensaje del usuario en Supabase
+        user_message_id = save_message_to_supabase(sender, "user", message_text)
+        logger.info(f"User message saved with ID: {user_message_id}")
+        
+        # CRÍTICO: Analizar si es una solicitud inteligente de recordatorio ANTES de procesar con AI
+        reminder_info = parse_reminder_request(message_text, sender)
+        
+        if reminder_info and reminder_info.get("detected"):
+            logger.info("DETECTED REMINDER REQUEST - Creating reminder...")
+            # Es una solicitud de recordatorio - configurar automáticamente
+            response = create_intelligent_reminder(sender, reminder_info)
+            logger.info(f"Reminder creation response: {response}")
+            
+            # Guardar respuesta en Supabase
+            save_message_to_supabase(sender, "assistant", response)
+            
+            return response
+        
+        logger.info("No reminder detected - processing as normal conversation")
+        
+        # No es recordatorio, procesar como conversación normal
+        current_history = chat_history.copy()
+        current_history.append({"role": "user", "content": message_text})
+        
+        # Generate AI response with retry mechanism
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = generate_ai_response_with_context(
+                    current_history, 
+                    message_text, 
+                    sender
+                )
+                
+                # Guardar respuesta del AI en Supabase
+                ai_message_id = save_message_to_supabase(sender, "assistant", response)
+                
+                if ai_message_id:
+                    logger.info(f"Generated and saved AI response")
+                    return response
+                else:
+                    logger.error(f"Failed to save AI response for {sender}")
+                    return response  # Devolver respuesta aunque no se guardó
+            
+            except Exception as e:
+                logger.error(f"Attempt {attempt+1}/{max_retries} failed: {str(e)}")
+                if attempt == max_retries - 1:  # Last attempt
+                    raise
+                time.sleep(1)  # Wait before retrying
+        
+    except Exception as e:
+        logger.error(f"Error processing message: {str(e)}")
+        return "Lo siento, tuve un problema procesando tu mensaje. Por favor intenta de nuevo."
+
+
+
+
+
+
+
+
+
+
+
+def generate_ai_response_with_context(chat_history: List[Dict[str, str]], user_message: str, user_phone: str) -> str:
+    """
+    Generate a response using the Google Gemini model with enhanced context.
+    """
+    import google.generativeai as genai
+    
+    genai.configure(api_key=GOOGLE_API_KEY)
+    
+    generation_config = {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 0,
+        "max_output_tokens": 1000,
+    }
+    
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    ]
+    
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        generation_config=generation_config,
+        safety_settings=safety_settings,
+    )
+    
+    # Format conversation history para Gemini
+    formatted_history = []
+    for message in chat_history:
+        role = "user" if message["role"] == "user" else "model"
+        formatted_history.append({"role": role, "parts": [message["content"]]})
+    
+    # Obtener estadísticas del usuario para personalización
+    user_stats = get_user_stats(user_phone)
+    
+    # Obtener recordatorios activos del usuario para el contexto
+    active_reminders = get_user_reminders_supabase(user_phone)
+    
+    # Enhanced system message con información de usuario
+    user_context = ""
+    if user_stats.get("total_messages", 0) > 5:
+        user_context = f"Este usuario ha tenido {user_stats['total_messages']} mensajes contigo, así que ya te conoce."
+    
+    reminders_context = ""
+    if active_reminders:
+        reminder_types = [r['reminder_type'] for r in active_reminders]
+        reminders_context = f"Este usuario tiene {len(active_reminders)} recordatorios activos: {', '.join(reminder_types)}"
+    
+    system_message = f"""
+    # 0. IDENTIDAD
+    Tu nombre es *Noa*, asistente personal entrenada por Diego. Eres cálida,
+    clara y cercana. Respondes siempre en el idioma del usuario.
+    
+    # CONTEXTO DEL USUARIO
+    {user_context}
+    {reminders_context}
+    
+    # 1. BIENVENIDA
+    Hola! Soy Noa, tu asistente personal entrenada por Diego. Sí, soy un
+    robot… ¡pero nada frío ni cuadrado! 😅 He escuchado dos años de consultas,
+    charlas y hasta sus chistes. 🧠💛
+    
+    Disponible 24/7 para resolver dudas, elegir suplementos o descifrar
+    datos de tu test, sin drama. ✨ También configuro recordatorios automáticamente
+    cuando me lo pidas en lenguaje natural. 💬
+    
+    # 2. FORMATO WHATSAPP
+    - 1–3 líneas por mensaje (<400 car.).
+    - *Negritas* y *cursivas* para resaltar. Emoji opcional, máx. 1 🙂
+    - URLs completas ("https://…") en su propia línea → toque único para abrir.
+    - No uses formato Markdown de enlaces (nada de [ ]( )).
+    
+    # 3. RECORDATORIOS INTELIGENTES
+    Cuando detectes que el usuario quiere recordatorios, explícale que:
+    - Puedes configurar recordatorios automáticamente
+    - Solo necesita decirte qué quiere recordar y cuándo
+    - Ejemplos: "recuérdame tomar agua cada hora", "quiero que me recuerdes tomar magnesio por la mañana"
+    - También hay comandos manuales: /agua, /suplemento, /mis_recordatorios
+    
+    # 4. FUENTES
+    {knowledge_content}
+    
+    {knowledge_product}
+    
+    # 5. LÍMITES
+    - Sin diagnósticos definitivos.
+    - Cero marketing invasivo.
+    - Los recordatorios son una herramienta de apoyo, no reemplazan supervisión médica.
+    - Si el usuario solicita recordatorios pero no detectaste los detalles, pídele que sea más específico.
+    """
+    
+    formatted_history.insert(0, {"role": "model", "parts": [system_message]})
+    
+    # Generate response
+    chat = model.start_chat(history=formatted_history)
+    response = chat.send_message(user_message)
+    
+    return response.text
+
+def handle_reminder_command(sender: str, command: str) -> str:
+    """Manejar comandos manuales de recordatorios"""
+    command = command.lower().strip()
+    
+    if command == '/ayuda' or command == '/help':
+        return """🤖 *Comandos de Recordatorios:*
+
+*Inteligente (recomendado):*
+• "Recuérdame tomar agua cada hora"
+• "Quiero que me recuerdes tomar magnesio por la mañana"
+• "Configura un recordatorio para omega-3 a las 8 AM"
+
+*Comandos manuales:*
+• /agua - Recordatorio de agua cada hora
+• /agua_stop - Detener recordatorio de agua
+• /suplemento [nombre] [horarios] - Recordatorio manual
+• /mis_recordatorios - Ver recordatorios activos
+• /stop_todo - Detener todos los recordatorios
+
+¡Es más fácil solo decirme qué quieres recordar! 😊"""
+    
+    elif command == '/agua':
+        reminder_id = save_reminder_supabase(
+            user_phone=sender,
+            reminder_type="water",
+            message="💧 ¡Es hora de tomar agua! Mantente hidratado para tu salud.",
+            interval_minutes=60
+        )
+        
+        if reminder_id:
+            scheduler.add_job(
+                func=send_reminder,
+                trigger=IntervalTrigger(hours=1),
+                args=[sender, "💧 ¡Es hora de tomar agua! Mantente hidratado para tu salud."],
+                id=f"water_{sender}_{reminder_id}",
+                replace_existing=True
+            )
+            return "💧 ¡Recordatorio de agua activado! Te recordaré cada hora.\n\nPara detenerlo: /agua_stop"
+        else:
+            return "❌ Error al crear recordatorio de agua."
+    
+    elif command == '/agua_stop':
+        success = deactivate_reminder_supabase(sender, "water")
+        if success:
+            # Remover jobs del scheduler
+            jobs = scheduler.get_jobs()
+            for job in jobs:
+                if f"water_{sender}" in job.id:
+                    scheduler.remove_job(job.id)
+            return "✅ Recordatorio de agua desactivado."
+        else:
+            return "❌ No se pudo desactivar el recordatorio."
+    
+    elif command.startswith('/suplemento'):
+        try:
+            parts = command.split(' ', 2)
+            if len(parts) < 3:
+                return "❌ Formato: /suplemento [nombre] [horarios]\nEjemplo: /suplemento Magnesio 08:00,20:00\n\n💡 O simplemente dime: 'quiero que me recuerdes tomar magnesio por la mañana'"
+            
+            supplement_name = parts[1]
+            times = parts[2].split(',')
+            
+            created_count = 0
+            for time_str in times:
+                try:
+                    hour, minute = map(int, time_str.split(':'))
+                    
+                    reminder_id = save_reminder_supabase(
+                        user_phone=sender,
+                        reminder_type="supplement",
+                        message=f"💊 Es hora de tomar tu {supplement_name}",
+                        cron_expression=f"{minute} {hour} * * *"
+                    )
+                    
+                    if reminder_id:
+                        scheduler.add_job(
+                            func=send_reminder,
+                            trigger=CronTrigger(hour=hour, minute=minute),
+                            args=[sender, f"💊 Es hora de tomar tu {supplement_name}"],
+                            id=f"supplement_{supplement_name}_{sender}_{reminder_id}",
+                            replace_existing=True
+                        )
+                        created_count += 1
+                        
+                except ValueError:
+                    continue
+            
+            if created_count > 0:
+                return f"💊 Recordatorio para {supplement_name} activado en: {', '.join(times)}"
+            else:
+                return "❌ Error al crear recordatorio de suplemento."
+        
+        except Exception as e:
+            return "❌ Error al crear recordatorio. Verifica el formato."
+    
+    elif command == '/mis_recordatorios':
+        reminders = get_user_reminders_supabase(sender)
+        if not reminders:
+            return "📝 No tienes recordatorios activos.\n\n💡 Dime qué quieres recordar y yo lo configuro automáticamente."
+        
+        response = "📝 *Tus recordatorios activos:*\n\n"
+        for i, reminder in enumerate(reminders, 1):
+            if reminder["interval_minutes"]:
+                interval_hours = reminder["interval_minutes"] // 60
+                response += f"{i}. {reminder['reminder_type'].title()}: cada {interval_hours} horas\n"
+            else:
+                response += f"{i}. {reminder['reminder_type'].title()}: horario específico\n"
+        
+        return response
+    
+    elif command == '/stop_todo':
+        # Desactivar en Supabase
+        if supabase:
+            result = supabase.table("reminders").update({"is_active": False}).eq("user_phone", sender).execute()
+            count = len(result.data) if result.data else 0
+        else:
+            count = 0
+        
+        # Remover jobs del scheduler
+        jobs = scheduler.get_jobs()
+        for job in jobs:
+            if sender in job.id:
+                scheduler.remove_job(job.id)
+        
+        return f"✅ Se han desactivado {count} recordatorios."
+    
+    else:
+        return "❌ Comando no reconocido. Escribe /ayuda para ver comandos.\n\n💡 Es más fácil solo decirme qué quieres recordar en lenguaje natural."
+
+# ==================== INITIALIZATION ====================
+
+def load_and_schedule_reminders():
+    """Cargar y programar todos los recordatorios desde Supabase"""
+    try:
+        reminders = load_reminders_supabase()
+        scheduled_count = 0
+        
+        for reminder in reminders:
+            try:
+                user_phone = reminder["user_phone"]
+                reminder_type = reminder["reminder_type"]
+                message = reminder["message"]
+                reminder_id = reminder["id"]
+                
+                if reminder["interval_minutes"]:
+                    # Recordatorio por intervalo
+                    interval_minutes = reminder["interval_minutes"]
+                    
+                    scheduler.add_job(
+                        func=send_reminder,
+                        trigger=IntervalTrigger(minutes=interval_minutes),
+                        args=[user_phone, message],
+                        id=f"{reminder_type}_{user_phone}_{reminder_id}",
+                        replace_existing=True
+                    )
+                    scheduled_count += 1
+                    
+                elif reminder["cron_expression"]:
+                    # Recordatorio por horario específico
+                    parts = reminder["cron_expression"].split()
+                    if len(parts) >= 2:
+                        minute, hour = int(parts[0]), int(parts[1])
+                        
+                        scheduler.add_job(
+                            func=send_reminder,
+                            trigger=CronTrigger(minute=minute, hour=hour),
+                            args=[user_phone, message],
+                            id=f"{reminder_type}_{user_phone}_{reminder_id}",
+                            replace_existing=True
+                        )
+                        scheduled_count += 1
+                        
+            except Exception as e:
+                logger.error(f"Error scheduling reminder {reminder.get('id', 'unknown')}: {str(e)}")
+                continue
+        
+        logger.info(f"Successfully scheduled {scheduled_count} reminders from Supabase")
+        return scheduled_count
+        
+    except Exception as e:
+        logger.error(f"Error loading reminders from Supabase: {str(e)}")
+        return 0
+
+def initialize_system():
+    """Inicializar sistema completo"""
+    logger.info("Initializing complete system with intelligent reminders...")
+    
+    if not supabase:
+        logger.warning("Supabase not configured - persistent features will not work")
+        return False
+    
+    try:
+        # Verificar conexión con Supabase y tablas existentes
+        reminders_test = supabase.table("reminders").select("count", count="exact").execute()
+        chat_test = supabase.table("chat_history").select("count", count="exact").execute()
+        
+        logger.info(f"Connected to Supabase successfully")
+        logger.info(f"Reminders in DB: {reminders_test.count}")
+        logger.info(f"Chat messages in DB: {chat_test.count}")
+        
+        # Cargar y programar recordatorios existentes  
+        scheduled_count = load_and_schedule_reminders()
+        
+        logger.info(f"System initialized successfully. Scheduled {scheduled_count} reminders.")
+        logger.info("Intelligent reminder parsing enabled - users can request reminders in natural language!")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize system: {str(e)}")
+        return False
+
+# ==================== ROUTE HANDLERS ====================
+
+@app.route('/', methods=['GET'])
+def home():
+    """Home route to confirm the server is running."""
+    return jsonify({
+        "status": "online",
+        "message": "Epigen WhatsApp webhook server with intelligent reminders is running",
+        "version": "3.0.0",
+        "features": [
+            "AI Chat with Persistent History", 
+            "Intelligent Reminder Detection", 
+            "Manual Reminder Commands",
+            "Supabase Integration"
+        ]
+    }), 200
+
+@app.route('/webhook', methods=['GET', 'POST'])
+def webhook():
+    """Main webhook endpoint for WhatsApp."""
+    logger.info(f"Webhook called with method: {request.method}")
+    
+    if request.method == 'GET':
+        logger.info("Received webhook verification request")
+        return jsonify({"status": "webhook is active"}), 200
+    
+    try:
+        raw_data = request.get_data(as_text=True)
+        logger.info(f"Raw webhook data: {raw_data}")
+        
+        data = request.get_json()
+        
+        if data.get("typeWebhook") == "incomingMessageReceived":
+            message_data = data.get("messageData", {})
+            
+            if message_data.get("typeMessage") == "textMessage":
+                sender = data["senderData"]["sender"].split("@")[0]
+                message_text = message_data["textMessageData"]["textMessage"]
+                logger.info(f"Received message from {sender}: {message_text}")
+                
+                ai_response = process_message(sender, message_text)
+                logger.info(f"Generated response: {ai_response[:100]}...")
+                
+                send_result = send_whatsapp_message(sender, ai_response)
+                logger.info(f"Send result: {send_result}")
+                
+        return jsonify({"status": "message processed"}), 200
+    
+    except Exception as e:
+        logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Enhanced health check endpoint"""
+    green_api_status = "configured" if GREEN_API_ID and GREEN_API_TOKEN else "not configured"
+    google_api_status = "configured" if GOOGLE_API_KEY else "not configured"
+    supabase_status = "configured" if supabase else "not configured"
+    
+    # Obtener estadísticas adicionales si Supabase está disponible
+    supabase_stats = {}
+    if supabase:
+        try:
+            reminders_result = supabase.table("reminders").select("count", count="exact").execute()
+            messages_result = supabase.table("chat_history").select("count", count="exact").execute()
+            
+            supabase_stats = {
+                "total_reminders": reminders_result.count,
+                "total_messages": messages_result.count,
+                "connection": "healthy"
+            }
+        except Exception as e:
+            supabase_stats = {
+                "connection": "error",
+                "error": str(e)
+            }
+    
+    return jsonify({
+        "status": "healthy",
+        "timestamp": time.time(),
+        "services": {
+            "green_api": green_api_status,
+            "google_ai": google_api_status,
+            "supabase": supabase_status
+        },
+        "scheduled_jobs": len(scheduler.get_jobs()) if scheduler else 0,
+        "supabase_stats": supabase_stats,
+        "features": {
+            "intelligent_reminders": True,
+            "persistent_chat": True,
+            "manual_commands": True
+        }
+    }), 200
+
+@app.route('/active_reminders', methods=['GET'])
+def get_active_reminders():
+    """Endpoint para ver recordatorios activos"""
+    try:
+        if not supabase:
+            return jsonify({"status": "error", "message": "Supabase not configured"}), 500
+            
+        result = supabase.table("reminders").select("user_phone, reminder_type, message, interval_minutes, is_active, created_at").order("created_at", desc=True).limit(20).execute()
+        
+        jobs = scheduler.get_jobs()
+        active_jobs = [{"id": job.id, "next_run": str(job.next_run_time)} for job in jobs]
+        
+        return jsonify({
+            "status": "success",
+            "reminders_in_db": len(result.data) if result.data else 0,
+            "active_jobs": len(active_jobs),
+            "jobs": active_jobs[:10],
+            "reminders": [
+                {
+                    "user": r["user_phone"],
+                    "type": r["reminder_type"],
+                    "message": r["message"][:50] + "..." if len(r["message"]) > 50 else r["message"],
+                    "interval": r["interval_minutes"],
+                    "active": r["is_active"],
+                    "created": r["created_at"]
+                } for r in (result.data[:10] if result.data else [])
+            ]
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/chat_stats/<phone>', methods=['GET'])
+def get_chat_stats(phone):
+    """Endpoint para obtener estadísticas de chat de un usuario"""
+    try:
+        stats = get_user_stats(phone)
+        recent_messages = get_chat_history_from_supabase(phone, limit=5)
+        active_reminders = get_user_reminders_supabase(phone)
+        
+        return jsonify({
+            "status": "success",
+            "user_phone": phone,
+            "stats": stats,
+            "recent_messages_count": len(recent_messages),
+            "active_reminders_count": len(active_reminders),
+            "reminders": [r["reminder_type"] for r in active_reminders]
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ==================== WHATSAPP INTEGRATION ====================
+
+def send_whatsapp_message(recipient: str, message: str) -> Optional[Dict[str, Any]]:
+    """Send a message back to the user via WhatsApp."""
+    url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
+    
+    payload = {
+        "chatId": f"{recipient}@c.us",
+        "message": message
+    }
+    
+    try:
+        response = requests.post(url, json=payload)
+        response_data = response.json()
+        
+        if response.status_code == 200 and response_data.get("idMessage"):
+            logger.info(f"Message sent to {recipient}: {message[:50]}...")
+        else:
+            logger.error(f"Error sending message: {response_data}")
+        
+        return response_data
+    
+    except Exception as e:
+        logger.error(f"Exception when sending message: {str(e)}")
+        return None
+
+# ==================== SERVER STARTUP ====================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    # Inicializar sistema completo
+    initialize_system()
+    
+    # Get port from environment or use default
+    port = int(os.environ.get('PORT', 7860))
+    
+    # Log the server startup
+    logger.info(f"Starting server on port {port}")
+    logger.info("🤖 Intelligent Reminder System Ready!")
+    logger.info("Users can now request reminders in natural language:")
+    logger.info("  • 'Recuérdame tomar agua cada hora'")
+    logger.info("  • 'Quiero que me recuerdes tomar magnesio por la mañana'")
+    logger.info("  • 'Configura un recordatorio para omega-3 a las 8 AM'")
+    
+    # Run the server using Uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=port, interface="wsgi")

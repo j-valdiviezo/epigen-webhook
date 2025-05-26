@@ -1,0 +1,2845 @@
+"""
+WhatsApp Webhook Server for Epigen Chatbot with Ultra-Flexible Smart Reminders
+This server receives webhook events from WhatsApp via Green API,
+processes them using Google's Gemini AI model, and sends responses
+back to the user. Features ULTRA-FLEXIBLE intelligent reminder setup with DECIMAL support.
+"""
+import os
+import json
+import time
+import sys
+import re
+import uuid
+import random
+from typing import Dict, List, Any, Optional
+import requests
+from flask import Flask, request, jsonify
+from loguru import logger
+from dotenv import load_dotenv
+
+# Imports para recordatorios
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
+from datetime import datetime, timedelta
+import pytz
+import atexit
+from supabase import create_client, Client
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Flask application
+app = Flask(__name__)
+
+# ==================== CONFIGURATION ====================
+# Get API credentials from environment variables
+GREEN_API_ID = os.environ.get("GREEN_API_ID")
+GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+
+# Supabase configuration
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
+logger.info(f"GREEN_API_ID={GREEN_API_ID}, GREEN_API_TOKEN={GREEN_API_TOKEN}")
+logger.info(f"SUPABASE_URL={SUPABASE_URL}")
+
+# Check if required environment variables are set
+if not GREEN_API_ID or not GREEN_API_TOKEN:
+    logger.warning("WhatsApp API credentials not set. Webhook will not be able to send messages.")
+if not GOOGLE_API_KEY:
+    logger.warning("Google API key not set. AI responses will not work.")
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    logger.warning("Supabase credentials not set. Reminders will not work.")
+
+# Configure logging
+logger.remove()
+logger.add(sys.stdout, level="INFO")
+
+# ==================== REMINDERS SETUP ====================
+# Initialize Supabase client
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_ANON_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+# Initialize scheduler
+scheduler = BackgroundScheduler(timezone=pytz.timezone('America/Mexico_City'))
+scheduler.start()
+
+# Ensure scheduler shuts down properly
+atexit.register(lambda: scheduler.shutdown())
+
+# ==================== KNOWLEDGE BASE (SIMPLIFIED) ====================
+
+# Knowledge base content - abbreviated for brevity
+# Knowledge base content - replace with your actual content from the Streamlit app
+knowledge_product = """
+Te compartimos los enlaces directos de los suplementos que recomendamos. Todos tienen excelente calidad, buena absorción, no inﬂaman y están disponibles exclusivamente en Mercado Libre, para que compres con conﬁanza y seguridad.
+
+Te enviamos varias opciones del mismo suplemento, con diferentes marcas, precios y gramajes, para que puedas elegir la que mejor se adapte a tu presupuesto y necesidades.
+
+Te sugerimos adquirirlos desde estos enlaces, ya que son nuestras recomendaciones basadas en calidad, absorción y conﬁanza. Así te aseguras de elegir una opción efectiva y segura.
+
+Si algún enlace no está disponible, escríbenos y con gusto te ayudamos a encontrar otra opción conﬁable.
+
+
+
+# AL DESPERTAR (En ayunas, no rompen el ayuno)
+- Desparasitante (, Loxe, vermox, una sola toma)
+https://mercadolibre.com/sec/19cm8d4
+https://mercadolibre.com/sec/1LMdCut
+
+- Metil Folato (B9) 1000 mcg
+https://mercadolibre.com/sec/1jqcQz1
+https://mercadolibre.com/sec/2skmb7R
+https://mercadolibre.com/sec/2J43yS2
+
+- Benfotiamina o Tiamina pirofosfato(B1) 200 mg
+https://mercadolibre.com/sec/2Uwf5jh
+https://mercadolibre.com/sec/1pziVzB
+
+- Metilcobalamina B12 2000 mcg
+https://mercadolibre.com/sec/2J43yS2
+https://mercadolibre.com/sec/2kJpVez
+https://mercadolibre.com/sec/2YPysQS
+https://mercadolibre.com/sec/1TkatqB
+
+- Biotina 400 mcg
+https://mercadolibre.com/sec/1cPkpFC
+https://mercadolibre.com/sec/16XsDyw
+https://mercadolibre.com/sec/1tqo2Nn
+
+- Ácido pantoténico → Pantetina (B5) 250 mg
+https://mercadolibre.com/sec/2dzNNBH
+https://mercadolibre.com/sec/2g6TqSK
+
+- Piridoxina B6 200 mg
+https://mercadolibre.com/sec/1ypkdoX
+https://mercadolibre.com/sec/2bYj2RW
+
+- Riboﬂavina B2 100 mg)
+https://mercadolibre.com/sec/1sF6rLk
+https://mercadolibre.com/sec/1pp5esi
+
+- Nicotinamida mononucleótido (B3 - Niacinamide) 500 mg Precursor NAD de 200 mg. (Posible enrojecimiento y comezón en la piel) dado el caso favor de suspenderlo y tomar un antihistamínico Loratadina o Cetirizina de 10 mg ambas. Una sola pastillas al día.
+https://mercadolibre.com/sec/1npKHjw
+https://mercadolibre.com/sec/22K1AUj
+https://mercadolibre.com/sec/2kFVGJn
+https://mercadolibre.com/sec/213bbqE
+https://mercadolibre.com/sec/2rJjmcj
+https://mercadolibre.com/sec/1ZFtY9y
+
+- Litio 1000 mcg. Cabe mencionar que es un Litio natural. Que contiene el huevo y algunos mariscos.
+https://mercadolibre.com/sec/1vXxrht
+https://mercadolibre.com/sec/1FsP3oU
+https://mercadolibre.com/sec/2PFsRJa
+https://mercadolibre.com/sec/343w3zm
+
+- Orégano 500 mg (compra solo 2 de los suplementos para hongos)
+https://mercadolibre.com/sec/1uzJWkw
+https://mercadolibre.com/sec/1339T9T
+https://mercadolibre.com/sec/2FzNJRW
+
+- Echinacea purpurea 500 mg (compra solo 2 de los suplementos para hongos)
+https://mercadolibre.com/sec/24Hwj93
+https://mercadolibre.com/sec/159NQ8C (5 gotas)
+
+- Candida (compra solo 2 de los suplementos para hongos)
+https://mercadolibre.com/sec/2KaBBnm
+https://mercadolibre.com/sec/2uDREX2
+
+- Chlorella cápsulas 1000 mg (radiación)
+https://mercadolibre.com/sec/2hYrayP
+https://mercadolibre.com/sec/19xY5ew
+https://mercadolibre.com/sec/1Z4VXXJ (una cucharada)
+
+- Cucharada de vinagre de manzana en ayunas (bacterias)
+https://mercadolibre.com/sec/2Ctaico
+https://mercadolibre.com/sec/1wCqJHS
+
+- Curcuma en capsulas 300 mg (bacterias)
+https://mercadolibre.com/sec/2J6r2S8
+https://mercadolibre.com/sec/2wTJfJv
+https://mercadolibre.com/sec/1zXBvn6
+
+- Suplementos de ajo negro 500mg (parásitos, esporas, señales viales, señales post virales)
+https://mercadolibre.com/sec/1DorM5F
+https://mercadolibre.com/sec/191GCBf
+https://mercadolibre.com/sec/1egGDJW
+
+- Suplemento capsulas jengibre 500 mg (señales virales y post virales)
+https://mercadolibre.com/sec/1aoPico
+https://mercadolibre.com/sec/11bDdkM
+
+- Semillas de calabaza (parásitos) comer un puño.
+https://mercadolibre.com/sec/27EGgwj
+https://mercadolibre.com/sec/2on1mMq
+https://mercadolibre.com/sec/1usfPtw
+
+- Cucharada de aceite de coco (parásitos)
+https://mercadolibre.com/sec/1qYqYTw
+https://mercadolibre.com/sec/1V41EH5
+https://mercadolibre.com/sec/1fWgcxE
+
+- Manganeso 10 mg
+https://mercadolibre.com/sec/31ENxw7
+https://mercadolibre.com/sec/28dFJT5
+https://mercadolibre.com/sec/2q5kf82
+
+
+
+# Después de tu primer alimento
+- Omega 3 de 1000 mg con mayor concentración de EPA:
+https://mercadolibre.com/sec/33D7Fsc
+https://mercadolibre.com/sec/2NsSYzn
+https://mercadolibre.com/sec/2yPMzMY
+https://mercadolibre.com/sec/2nJXv4g
+https://mercadolibre.com/sec/2uYTiW4
+
+- Omega 3 de 1000 mg con mayor concentración de DHA:
+https://mercadolibre.com/sec/2yPMzMY
+https://mercadolibre.com/sec/2watQBh
+https://mercadolibre.com/sec/2J6p2x1
+https://mercadolibre.com/sec/2uYTiW4
+
+- Omega 3 de 1000 mg con mayor concentración de ALA:
+https://mercadolibre.com/sec/2cAVtTa
+
+- Vitamina A1 2000 mcg
+No hay enlaces disponibles aun
+
+- Co enzima Q10 200 mg
+https://mercadolibre.com/sec/1qRdEvi
+https://mercadolibre.com/sec/1Qk5Swr
+https://mercadolibre.com/sec/12tCKEj
+
+- Vitamina E 268 mg o 400 UI Tomar por 2 meses
+https://mercadolibre.com/sec/1TRQLG4
+https://mercadolibre.com/sec/28tLrpt
+https://mercadolibre.com/sec/1fvLEib
+
+- Vitamina D3 5000 iU
+https://mercadolibre.com/sec/19aKKqZ
+https://mercadolibre.com/sec/2tv564R Tomar 2 capsulas
+https://mercadolibre.com/sec/1aSeBcbTomar 2 capsulas
+
+- Vitamina K1 100 mcg
+https://mercadolibre.com/sec/1F4sKJ8
+
+- Vitamina K2 100 mcg
+https://mercadolibre.com/sec/1GQ9Wxo
+https://mercadolibre.com/sec/1Vk2msM
+https://mercadolibre.com/sec/2PT9LmH
+
+- Betaína HCI con pepsin de 600 mg.
+https://mercadolibre.com/sec/2iiN885
+https://mercadolibre.com/sec/2WopC4z
+https://mercadolibre.com/sec/1Cr2FyM
+
+- Molibdeno 250 mcg
+https://mercadolibre.com/sec/31ENxw7
+https://mercadolibre.com/sec/2XsnSdt
+https://mercadolibre.com/sec/188ZToY
+
+- L-Fenilalanina 500 mg
+https://mercadolibre.com/sec/1Mdc8iw
+https://mercadolibre.com/sec/2fLaPYF
+https://mercadolibre.com/sec/13FJ346
+https://mercadolibre.com/sec/1NA7nfw
+
+- L-Isoleucina (lo consigues como BCAA en cápsula sin azúcar)
+https://mercadolibre.com/sec/1XEMidj
+https://mercadolibre.com/sec/16wVZuL
+
+- Acido alfa lipoico 500 mg
+https://mercadolibre.com/sec/2Y2sFsD
+https://mercadolibre.com/sec/1FG7Qkx
+https://mercadolibre.com/sec/1eXVvGm
+https://mercadolibre.com/sec/2TuGLg8
+https://mercadolibre.com/sec/2RhYcsS
+https://mercadolibre.com/sec/2ck8Vu4
+
+- L- Carnitina 500 mg
+https://mercadolibre.com/sec/1GyhFvk
+https://mercadolibre.com/sec/1Qonf6U
+https://mercadolibre.com/sec/2C7USF6
+https://mercadolibre.com/sec/1rksCKs
+
+- L-Serina de 500 mg
+https://mercadolibre.com/sec/28SKmXY
+https://mercadolibre.com/sec/22H5tu9
+https://mercadolibre.com/sec/2fB9EBX
+
+- L-Ácido Glutámico 500 mg
+https://mercadolibre.com/sec/2D6dfgi
+
+- L-Arginina 500 mg
+https://mercadolibre.com/sec/1UUvxLN
+https://mercadolibre.com/sec/2xrkE1Y
+https://mercadolibre.com/sec/2iVt3Lu
+
+- L-Glicina 500 mg
+https://mercadolibre.com/sec/1wXLxJW (una cucharada pequeña)
+https://mercadolibre.com/sec/1T7HR6g (una cucharas pequeña)
+
+- L-Glutamina 1000 mg
+https://mercadolibre.com/sec/13Si6XT
+https://mercadolibre.com/sec/13Si6XT
+https://mercadolibre.com/sec/2wBvb6q (una cucharada pequeña)
+https://mercadolibre.com/sec/1K2bSE6 (una cucharada pequeña)
+https://mercadolibre.com/sec/2s4bakK
+
+- L-Citrulina 500 mg
+https://mercadolibre.com/sec/1zaWvBb
+https://mercadolibre.com/sec/1zqY9od (una cuchara pequeña)
+https://mercadolibre.com/sec/2K7C776
+https://mercadolibre.com/sec/2iZ3iUV
+https://mercadolibre.com/sec/1gtrYtP
+
+- L-Beta Alanina 1000 MG 
+https://mercadolibre.com/sec/2qytFou (una cucharada pequeña)
+https://mercadolibre.com/sec/12WeYKq (una cucharada pequeña)
+https://mercadolibre.com/sec/2E7ziiu (una cucharas pequeña)
+
+- L-Metionina 1000 mg
+https://mercadolibre.com/sec/16jNPLm
+https://mercadolibre.com/sec/1aCLLhJ
+https://mercadolibre.com/sec/16jNPLm
+https://mercadolibre.com/sec/2xU9KU8
+
+- L-Cisteina 500 mg
+https://mercadolibre.com/sec/13GtyCx
+https://mercadolibre.com/sec/2rZ2dMw
+https://mercadolibre.com/sec/1mYJbtN
+https://mercadolibre.com/sec/2bCo9uJ
+https://mercadolibre.com/sec/1rfTXpA
+
+- L-Cistina 500 mg
+No hay enlaces disponibles aun
+
+- L-Lisina 1000 mg
+https://mercadolibre.com/sec/1MEqpmV
+https://mercadolibre.com/sec/1Pv3PTX
+https://mercadolibre.com/sec/1Wm4fgZ
+https://mercadolibre.com/sec/2JAxEK9
+https://mercadolibre.com/sec/1xgD8rP
+
+- L-Ácido Aspártico 1000m g
+https://mercadolibre.com/sec/1FarAxe
+https://mercadolibre.com/sec/1mPQk2W
+https://mercadolibre.com/sec/2AHHLJN
+
+- L-Treonina 500 mg
+https://mercadolibre.com/sec/16wVZuL
+https://mercadolibre.com/sec/1Sk86H4
+
+- L-Prolina 1000 mg
+https://mercadolibre.com/sec/2sCscEf
+https://mercadolibre.com/sec/1pndazE
+
+- L-Valina 500 mg (lo consigues como BCAA en cápsula sin azúcar)
+https://mercadolibre.com/sec/16wVZuL
+https://mercadolibre.com/sec/2Z7xj6X (una cucharada pequeña)
+https://mercadolibre.com/sec/2rV7Q8u (una cucharada pequeña)
+
+- L-Histidina 500 mg
+https://mercadolibre.com/sec/2BuPsVi
+https://mercadolibre.com/sec/31XYbaR
+https://mercadolibre.com/sec/2gkPtNE
+
+- L-Taurina de 500 mg
+https://mercadolibre.com/sec/1VyjgnG
+https://mercadolibre.com/sec/2mGzTvV
+https://mercadolibre.com/sec/1T1T7ZD
+
+- L-Leucina 500 mg
+
+https://mercadolibre.com/sec/2ieMjzy (una medida )
+https://mercadolibre.com/sec/16wVZuL (una medida )
+https://mercadolibre.com/sec/23jk4cj
+https://mercadolibre.com/sec/2QEGX1r (una cucharada)
+
+- L-Tirosina 500 mg
+https://mercadolibre.com/sec/1Y51cZJ
+https://mercadolibre.com/sec/1JAoe3x
+https://mercadolibre.com/sec/2MMphPp
+https://mercadolibre.com/sec/2CDCutj
+https://mercadolibre.com/sec/1BLSzaT
+
+- L-Ornitina 500 mg
+https://mercadolibre.com/sec/2MqNVPP
+https://mercadolibre.com/sec/2MaSxSP
+https://mercadolibre.com/sec/1e1p767
+https://mercadolibre.com/sec/1ZPCTjR
+
+- L-Asparagina 500 mg (comer minimo 3 veces a la semana espárragos)
+No hay enlaces disponibles aun
+
+- L-Carnosina 500 mg
+https://mercadolibre.com/sec/1Juz1Mp
+https://mercadolibre.com/sec/2Xog7tR
+https://mercadolibre.com/sec/2ZH5f5g
+
+
+
+# DESPUÉS DE TU COMIDA
+- Vitamina C liposomada sin azúcar de 500 mg
+https://mercadolibre.com/sec/1n8wz4F tomar la mitad
+https://mercadolibre.com/sec/2NNqBKm
+https://mercadolibre.com/sec/2NNqBKm
+
+- Superóxido de dismutasa (sod) de 200 mg
+https://mercadolibre.com/sec/2uRnbbH
+https://mercadolibre.com/sec/2ZmAW8a
+
+- Yodo 150 mcg 3 ( 3 gotas)
+https://mercadolibre.com/sec/32PANji
+https://mercadolibre.com/sec/2aPgBHN
+https://mercadolibre.com/sec/2PzPcAw
+
+- Sodio (usar ﬂor de sal o sal céltica con todos tus alimentos)
+https://mercadolibre.com/sec/1XPbkT4
+https://mercadolibre.com/sec/1gukwrZ
+https://mercadolibre.com/sec/1oz5wK5
+https://mercadolibre.com/sec/2cHJ8q1
+https://mercadolibre.com/sec/2E6N6C6
+
+- Cobre 2 mg
+https://mercadolibre.com/sec/1Uz8ZYo
+https://mercadolibre.com/sec/2TUuVrm
+https://mercadolibre.com/sec/1b3My5a
+
+- Silicio 500 mg
+https://mercadolibre.com/sec/2fprwb3
+https://mercadolibre.com/sec/1jG17d2 (media cucharad pequeña)
+
+- Fósforo 200 mg
+https://mercadolibre.com/sec/2B7Y8bb
+https://mercadolibre.com/sec/2jtVCnj
+https://mercadolibre.com/sec/1CtG7Uk
+
+- Calcio 600 mg (Solo si realiza actividad física de fuerza , caminar no cuenta)
+https://mercadolibre.com/sec/1Utzh7w
+https://mercadolibre.com/sec/2rJBG7m
+https://mercadolibre.com/sec/2w9rKkh
+https://mercadolibre.com/sec/28Rr3BC
+
+- Hierro 10 mg.
+https://mercadolibre.com/sec/1N2fGFi Tomar la mitad
+https://mercadolibre.com/sec/2a2Ccg4 tomar la mitad
+https://mercadolibre.com/sec/1GBZL8X tomar la mitad
+
+- Azufre (MSM) 1000 mg
+https://mercadolibre.com/sec/2weJVbt
+https://mercadolibre.com/sec/1DBFFyi
+
+- Sulforafano glucosinolato (DIM) 300 MG
+https://mercadolibre.com/sec/2irXMZP
+https://mercadolibre.com/sec/32xLbYo
+https://mercadolibre.com/sec/1XmRJ33
+
+- Cromo 200 mcg
+https://mercadolibre.com/sec/29ZmXLE
+https://mercadolibre.com/sec/1eFLB61
+https://mercadolibre.com/sec/1JVBDLT
+
+- Citrato de Potasio 1000 mg
+https://mercadolibre.com/sec/2WvXU8u
+https://mercadolibre.com/sec/1opvU6y
+https://mercadolibre.com/sec/1wqmf1k
+
+
+
+# UNA HORA ANTES DE DORMIR
+- Selenio 200 mcg
+https://mercadolibre.com/sec/1cPzkF2
+https://mercadolibre.com/sec/2gygZE3
+https://mercadolibre.com/sec/131tFC9
+
+- Zinc 50 mg
+https://mercadolibre.com/sec/343x6EX
+https://mercadolibre.com/sec/1MjmVEf
+https://mercadolibre.com/sec/2MZoe9H
+
+- Boro 3 mg
+https://mercadolibre.com/sec/2ZKudWz
+https://mercadolibre.com/sec/1b7CvDd
+https://mercadolibre.com/sec/1t7C4ji
+https://mercadolibre.com/sec/1yjQ1E7
+https://mercadolibre.com/sec/1yywvjj
+
+- Magnesio tipo glicinato de 350 mg
+https://mercadolibre.com/sec/2wncKNQ
+https://mercadolibre.com/sec/1vBmz42
+https://mercadolibre.com/sec/12nwJUB
+
+- Valeriana 1000mg (Sueño)
+https://mercadolibre.com/sec/1qbcanX
+https://mercadolibre.com/sec/11Zk4A9
+https://mercadolibre.com/sec/1BE7ZV2
+
+- Ñame Salvaje 1000 mg(menopausia)
+https://mercadolibre.com/sec/2SMWE8e
+
+- Vitex 1000 mg (menopausia)
+https://mercadolibre.com/sec/2obUhxe
+https://mercadolibre.com/sec/1tSEfXF
+https://mercadolibre.com/sec/2nx2w5W
+
+- Carotenoides: 20 mg
+https://mercadolibre.com/sec/2KsUKcq
+https://mercadolibre.com/sec/1n1k4Eb
+https://mercadolibre.com/sec/2Z2CKVR
+
+- Antocianinas 400 mg
+https://mercadolibre.com/sec/2gFVLnc
+https://mercadolibre.com/sec/1Aqxo19
+https://mercadolibre.com/sec/2jnLRPp
+
+- Polifenoles 500 mg
+https://mercadolibre.com/sec/2aszygF
+https://mercadolibre.com/sec/2GU8Utk
+https://mercadolibre.com/sec/2CaojCV
+
+- Flavonoides 500 mg
+https://mercadolibre.com/sec/1gn21Bm
+https://mercadolibre.com/sec/16oBrV5
+https://mercadolibre.com/sec/2YBbYxf
+
+- Glutation 500 mg (Metales pesados y quimicos-Hidrocarburos)
+https://mercadolibre.com/sec/1svrdne
+https://mercadolibre.com/sec/2yhkvuK
+https://mercadolibre.com/sec/1VekGx1
+https://mercadolibre.com/sec/2V2DPPp
+https://mercadolibre.com/sec/2VkSerY
+https://mercadolibre.com/sec/2y44bwx
+
+- L-Triptófano 500 mg
+https://mercadolibre.com/sec/2iZDjYE
+https://mercadolibre.com/sec/2WS7DTM
+https://mercadolibre.com/sec/1vgN1iU
+https://mercadolibre.com/sec/1w9PGFZ
+https://mercadolibre.com/sec/2iZgH1i
+
+- Inositol 500 mg
+https://mercadolibre.com/sec/2iZDjYE
+https://mercadolibre.com/sec/16aY71E
+https://mercadolibre.com/sec/2HviS2u
+https://mercadolibre.com/sec/13GjVz1
+
+- Fitoestrógenos (Dong Quai) 500 mg
+https://mercadolibre.com/sec/1yuW3KS
+https://mercadolibre.com/sec/1wFgJfu
+https://mercadolibre.com/sec/2DBhad2
+
+- Probiótico con la cepa Biﬁdobacterium cualquiera de esta cepa (Hongos)
+https://mercadolibre.com/sec/1CVCr3h
+https://mercadolibre.com/sec/2GPdKjX
+https://mercadolibre.com/sec/1kcrDnD
+
+- Probiótico con la cepa Saccharomyce Boulardii (Bacterias)
+https://mercadolibre.com/sec/2CrCyYM
+https://mercadolibre.com/sec/2Jtn5tb
+https://mercadolibre.com/sec/1EqbAUT
+
+- Ashwagandha
+No hay opciones disponibles aun
+
+###
+Si los encuentras en diferentes gramajes, si es pastilla la puedes partir, si es cápsula la puedes partir y diluir en
+agua.
+
+Estos suplementos son 100% naturales y no tienen efectos secundarios y no dañan tu riñón, tu hígado o algún
+otro órgano.
+
+Este protocolo de suplementación natural está fundamentado y cimentado en tu test Epigenético. Dicho conocimiento y
+tecnologia esta desarrollada y respaldada por https://www.epixlife.com
+y https://www.cell-wellbeing.es del cual formamos parte de su equipo como Epigen. Para más información da click en el enlace.
+Tecnología Certiﬁcada : El S-Drive cumple plenamente con la guía 1300013 de la FDA (UCM429674).
+
+Estas recomendaciones están basadas en evidencia científica y tienen como objetivo mejorar el estilo de vida. No constituyen una
+consulta médica ni un diagnóstico. Epigen se deslinda de cualquier mal uso de la información proporcionada. Se recomienda
+siempre consultar a un profesional de la salud para cualquier diagnóstico o tratamiento específico.
+"""
+
+knowledge_content = """
+# Datos de Epigen
+- WhatsApp: 5544918977
+- Direccion: Avenida de los Insurgentes 601, 03810 Col. Nápoles, CDMX, CP:03100
+- Sitio Web: https://epigen.mx/
+- Facebook: https://www.facebook.com/share/19twC6nMZH/?mibextid=LQQJ4d
+- Instagram: https://www.instagram.com/epigen.mx?igsh=MTVkbXphaDI5dnl4ZA==
+- Publico objetivo: Hombre o mujer que busque mejorar su salud y estilo de vida con pruebas químicas y de ADN preventivas. El cliente ya cuenta con tendencia sintomatica.
+- Propuesta de valor: 
+  1. Toma el control de tus hábitos
+  2. Domina tu cuerpo
+  3. Sé el dueño de tu propio cuerpo, domina tus padecimientos 
+  4. Entender tu cuerpo y conocerlo
+  5. Modificar la expresión de tus genes  
+  6. Prevenir enfermedades 
+  7. Checar tu estado de salud 
+ 
+
+    
+# Productos:
+## Test de prevención diabetes e infartos al corazón. 
+Enlace a video explicativo: https://drive.google.com/file/d/18PZYmAfmWiG3U8uvSnvKC1xlTzqO6q9Z/view?usp=sharing
+
+Que contiene: 
+
+1. Prueba rápida (HbA1c) hemoglobina glicosilada 
+Provistos:
+- Instructivo de uso
+- Prueba rápida en cartucho
+- Gotero
+- Vial con reactivo de corrimiento (Buffer)
+- Tubo capilar
+- Lanceta (punción capilar)
+- Almohadilla con alcohol (punción capilar)
+
+2. Prueba rápida de NT-proBNP:
+Prueba rápida en cartucho
+- Gotero
+- Reactivo de corrimiento (Buffer)
+- Instructivo de uso.
+
+¿Qué es la prueba NT-proBNP?
+Es un análisis de sangre que mide una proteína liberada por el corazón cuando está bajo estrés. Ayuda a detectar y monitorear problemas como insuficiencia cardíaca.
+
+Beneficios de la prueba NT-proBNP:
+- Detecta problemas temprano, incluso antes de síntomas.
+- Aclara síntomas como falta de aire o cansancio, diferenciando problemas cardíacos de otros.
+- Monitorea tratamientos para enfermedades cardíacas.
+
+¿Qué es HbA1c?
+Esta prueba es como un reporte trimestral de tus niveles de azúcar en sangre. No mide lo que comiste ayer, sino cómo ha estado tu azúcar en los últimos 2-3 meses.
+
+¿Por qué es útil la prueba HbA1c?
+- Detectar y controlar la diabetes: Si tienes diabetes o estás en riesgo, nos ayuda saber si tu estilo de vida está funcionando.
+- Prevenir complicaciones: Conocer tu HbA1c puede ayudarte a evitar problemas en el corazón, los riñones y los ojos, ya que el azúcar elevado puede dañarlos con el tiempo.
+
+Las 2 pruebas (HbA1c y NT-proBNP) no son invasivas y te dan tranquilidad sobre la salud de tu corazón y que tu glucosa está trabajando bien. ¡Una gran inversión para Si tienes antecedentes familiares de problemas cardíacos, diabetes síntomas como cansancio inexplicable, mucha sed, manchas oscuras en el cuello o axilas, o simplemente quieres asegurarte de que tu corazón y glucosa está en buen estado. ¡Invierte en tu tranquilidad y bienestar!
+
+
+
+## Test antiinflamatorio-segundo cerebro - intestino.
+Enlace a video explicativo: https://drive.google.com/file/d/1PzO3sOkxQ4hQOkpzs3BgD2eTDb2feDlR/view?usp=sharing
+
+¿Qué contiene?
+1. Prueba rápida de Calprotectina (heces) es un inmunoensayo cromatográfico de flujo lateral para la detección cualitativa de calprotectina en muestras de heces. 
+Contiene:
+- Prueba rápida en cartucho
+- Instructivo de uso
+- Tubo colector con reactivo de corrimiento
+- Gotero
+
+2. Prueba rapida H. Pylori:
+- Material para venopunción
+- Centrifuga
+- Lanceta (punción capilar)
+- Almohadilla con alcohol
+
+¿Qué es la calprotectina?
+Es una prueba que mide la inflamación en tu intestino. Es como un detector de problemas que nos dice si hay algo fuera de lo normal en tu sistema digestivo, como enfermedades inflamatorias (por ejemplo, colitis o enfermedad de Crohn).
+
+¿Qué es el H. pylori?
+El H. pylori es una bacteria que puede vivir en tu estómago y causar molestias como gastritis, úlceras e incluso aumentar el riesgo de otros problemas más graves si no se trata. Esta prueba detecta si la bacteria está presente.
+
+¿Qué tienen en común estas pruebas (calprotectina y H. pylori)?
+Ambas nos ayudan a identificar por qué tienes síntomas como dolor abdominal, diarrea, hinchazón, o acidez. Juntas, nos dan un panorama completo:
+Calprotectina: Indica si hay inflamación en el intestino.
+H. pylori: Busca si la bacteria está afectando tu estómago.
+
+¿Qué beneficios obtienes al hacerte ambas pruebas?
+- Diagnóstico temprano: Detectamos problemas como inflamación o infecciones antes de que empeoren.
+- Alivio de síntomas: Puedes mejorar tu calidad de vida al resolver molestias digestivas como dolor, acidez o diarrea.
+- Prevención de complicaciones: Evitas que pequeñas molestias se conviertan en enfermedades más graves, como úlceras o problemas intestinales crónicos.
+
+Si tienes molestias digestivas, estas pruebas son tu mejor aliado para entender qué pasa y solucionarlo antes de que sea más serio. ¡Con ellas, damos un paso firme hacia un sistema digestivo saludable y una mejor calidad de vida sin inflamación!
+
+
+
+## Test perdida de peso (Mujer) 
+Enlace a video explicativo: https://drive.google.com/file/d/1lPxL9qlaZ-knZnTlSDPxBpXti1q_S8OB/view?usp=sharing
+
+Que contiene?
+1. La prueba TSH (sangre/suero/plasma) es un inmunoensayo cromatográfico rápido para la detección cualitativa de la hormona estimulante de la tiroides (TSH) en sangre, suero o plasma humano. 
+Contiene:
+- Cartucho de prueba
+- Gotero
+- Buffer
+- Manual de instrucciones.
+
+2. Prueba rápida de Calprotectina (heces) es un inmunoensayo cromatográfico de flujo lateral para la detección cualitativa de calprotectina en muestras de heces. 
+Contiene:
+- Prueba rápida en cartucho
+- Instructivo de uso
+- Tubo colector con reactivo de corrimiento
+- Gotero
+
+Estas dos pruebas son como detectives que nos ayudan a entender si hay algo detrás de la dificultad para bajar de peso o de otros síntomas que puedas estar sintiendo. Te explico cómo funcionan y cómo pueden ayudarte:
+
+¿Qué es la prueba de calprotectina?
+Esta prueba analiza una proteína en tus heces para detectar si hay inflamación en tu intestino. ¿Por qué importa para la pérdida de peso? Porque una inflamación intestinal puede dificultar la absorción de nutrientes, causar molestias digestivas como hinchazón o diarrea, y afectar tu metabolismo.
+
+¿Qué es la prueba de TSH?
+Es una prueba de sangre que mide cómo está funcionando tu tiroides, una glándula clave para el control del peso. Si tienes una tiroides lenta (hipotiroidismo), tu metabolismo puede estar más lento, lo que hace que perder peso sea más difícil, además de causar cansancio y retención de líquidos.
+
+¿Cómo se complementan estas pruebas (calprotectina y TSH)?
+Juntas nos dan un panorama completo de dos aspectos clave para tu salud y peso:
+- Inflamación intestinal (calprotectina): Nos ayuda a detectar si hay problemas digestivos que están afectando tu bienestar y peso.
+- Función metabólica (TSH): Nos dice si tu tiroides está funcionando correctamente para mantener tu metabolismo activo.
+
+¿Qué beneficios obtienes al hacer estas pruebas?
+- Descubrir la raíz del problema: Si estás batallando con el peso o sientes síntomas como hinchazón, fatiga o cambios en el apetito, estas pruebas nos dicen si el problema viene del intestino, la tiroides o ambos.
+- Plan personalizado: Con los resultados, podemos ajustar tu alimentación.
+- Optimizar tu metabolismo: Si tu tiroides no está funcionando bien, podemos corregirlo y activar tu metabolismo para que perder peso sea más fácil.
+- Mejorar tu digestión: Resolver problemas intestinales no solo mejora tu bienestar general, sino que también ayuda a que tu cuerpo aproveche mejor los nutrientes y elimine toxinas de manera efectiva.
+
+Estas pruebas son como un mapa que nos guía para identificar y resolver cualquier obstáculo que esté afectando tu peso y tu salud en general. ¡Con ellas, damos el primer paso hacia una vida más saludable y un peso equilibrado!
+
+
+
+## Test perdida de peso (Hombre)
+¿Qué contiene?
+1. Prueba rápida de Calprotectina (heces) es un inmunoensayo cromatográfico de flujo lateral para la detección cualitativa de calprotectina en muestras de heces. 
+Contiene:
+- Prueba rápida en cartucho
+- Instructivo de uso
+- Tubo colector con reactivo de corrimiento
+- Gotero
+
+2. La prueba rápida Micro albumina cualitativa (Orina) es un inmunoensayo cromatográfico de flujo lateral para la detección cualitativa de albúmina en muestras de orina. 
+Contiene:
+- Prueba rápida en cartucho
+- Instructivo de uso
+- Gotero
+
+Inflamacion en tus intestino. Esto es importante porque una inflamación puede causar problemas digestivos, como hinchazón, diarrea o mala absorción de nutrientes, lo que puede dificultar la pérdida de peso y afectar tu bienestar.
+
+¿Qué es la prueba de albúmina en orina?
+Esta prueba evalúa si hay presencia de albúmina, una proteína que normalmente no debería estar en la orina. Si aparece, puede ser una señal de que tus riñones están bajo estrés o no están funcionando al 100%. Los riñones sanos son esenciales para eliminar toxinas y líquidos, procesos importantes en el control del peso.
+
+¿Cómo se complementan estas pruebas (calprotectina y albúmina en orina)?
+Ambas trabajan juntas para darnos una visión de dos aspectos importantes:
+- Digestión y absorción (calprotectina): Si hay inflamación intestinal, puede afectar cómo tu cuerpo procesa los alimentos y cómo se siente en general.
+- Eliminación y función renal (albúmina en orina): Detectar problemas en los riñones asegura que tu cuerpo esté eliminando toxinas y líquidos de forma efectiva, algo fundamental para un metabolismo saludable.
+
+¿Qué beneficios obtienes al realizarte estas pruebas?
+- Identificar obstáculos invisibles: Si tienes problemas para perder peso, síntomas digestivos o hinchazón, estas pruebas nos ayudan a detectar si el problema viene del intestino o de los riñones.
+- Prevenir complicaciones: Detectar problemas intestinales o renales a tiempo evita complicaciones más serias que puedan afectar tu salud.
+- Plan de acción personalizado: Con los resultados, podemos ajustar tu dieta, tratamiento o hábitos para mejorar la salud intestinal y renal, ayudando a que pierdas peso de manera más efectiva.
+- Mejor calidad de vida: Resolver estos problemas te hará sentir con más energía, menos hinchado y con un sistema que funcione mejor.
+
+Resumen: Estas pruebas son como un chequeo profundo de tu sistema digestivo y renal, dos pilares fundamentales para una pérdida de peso saludable. ¡Son el primer paso para entender qué está pasando y ayudarte a alcanzar tus metas de manera segura y efectiva!
+
+
+
+## Test Epigenetico
+Enlace a video explicativo: https://drive.google.com/file/d/1PFxFPTXlYNpgLMWB_wFJMl78lS9YPloH/view?usp=sharing
+
+Modifica la expresión de tus genes hasta en un 97% con nuestro test epigenético. Gracias a toda la información que nos da personalizada de ti. Es un traje a la medida para tus necesidades en base a:
+- Vitaminas ideales para ti en las dosis correctas reforzando el sistema inmunológico-intestino y cardiaco.
+- Renovación y ajuste de tu microbiota intestinal
+- Desintoxicación de metales pesados- químicos hidrocarburos- Radiación
+- Que alimentos no van contigo y cual si por 90 días.
+
+
+
+
+# Como realizar las pruebas:
+
+## Paso a paso del proceso del paciente durante su tratamiento solo kits:
+- Prevención diabetes-Infartos
+Video de como realizar la prueba: https://drive.google.com/file/d/18PZYmAfmWiG3U8uvSnvKC1xlTzqO6q9Z/view?usp=sharing
+- Inflamación-Intestino
+Video de como realizar la prueba: https://drive.google.com/file/d/11wlB1UtxLNy8m1DnT8tUUYuydf42ODXZ/view?usp=sharing
+- Bajar de peso 
+Video de como realizar la prueba: https://drive.google.com/file/d/1jZWQHGNv90Xrm-fdAHo769bN1ORg7jRE/view?usp=sharing
+
+Paso 1: Le llega el paquete - Realiza la prueba. Manda sus resultados en foto al whatsapp
+
+Paso 2: Confirmamos de recibido y comentar que en 24 horas o menos estar recibiendo la interpretación de sus resultados así como una  explicacion de los pasos a seguir. Así como trazar metas y objetivos a 2 meses. Ya que es un proyecto a 2 meses.
+
+Paso 3: Recepción de documentos-Video. Que mandaremos? 
+- Plan de alimentos de acuerdo a su padecimiento.
+- Suplementación natural así como adaptógenos adecuados a su padecimiento. 
+- Protocolos adecuados a su padecimiento y de acuerdo al cuestionario contestado previamente como: Mejorar el sueño, desintoxicacion y ayuno. 
+- Lo añadiremos a nuestra comunidad donde daremos conferencias e información valiosa de salud, alimentación entre otras.
+
+Paso 4: Contacto por whatsapp en todo momento. Pero al mes nosotros contactaremos par ver avances y ajuste a sus planes si se requiere.
+
+Paso 5: A los 2 meses de haber terminado su proyecto. Lo contactamos. Retroalimentación y resultados
+Recomendamos un nuevo test para validar resultados así como tendrá beneficios de descuento por ser cliente
+
+
+## Paso a paso del proceso del paciente durante su tratamiento solo kits:
+- Epigenético
+Video de como realizar la prueba: https://drive.google.com/file/d/1TQJlHe3_wnFCU-LxaWbQTGxiMr_dXDb1/view?usp=sharing
+
+Paso 1: Le llega el paquete - Se quita el cabello y manda sus resultados. Nosotros estaremos mandando pinzas para quitar el cabello, bolsa para colocar el cabello y la guía para que mande de regreso el cabello a nuestra oficina.
+
+Paso 2: Cuando tengamos el paquete de cabello Confirmamos de recibido y comentar que en 24 horas o menos estar recibiendo.
+La Interpretación de sus resultados así como la consulta grabada por una IA donde sera mi voz explicando los pasos a seguir. Así como trazar metas y objetivos a 3 meses. Ya que es un proyecto a 3 meses ya que el ciclo celular dura 3 meses.
+
+Paso 3: Recepción de documentos- Video. Que mandaremos?
+- Plan de alimentos de acuerdo a su padecimiento.
+- Suplementación de acuerdo al estudio de epigenetica. 
+- Protocolos de acuerdo al test como microbiota, desintoxicación, mejora el sueño. 
+- Lo añadiremos a nuestra comunidad donde daremos conferencias e información valiosa de salud, alimentación entre otras.
+
+Paso 4: Contacto por whatsapp en todo momento. Pero al mes y medio nosotros lo contactaremos par ver avances y ajuste a sus planes si se requiere.
+
+Paso 5: A los 3 meses de haber terminado su proyecto. Lo contactamos. Retroalimentación y resultados
+Recomendamos un nuevo test para validar resultados así como tendrá beneficios de descuento por ser cliente
+
+
+# Seguimiento para despues de hacerse los tests 
+Despues de que el paciente realiza un test epigenético inicial:
+1. Se aplica un cuestionario de evaluación específico según el objetivo
+2. Se implementa un régimen de ayuno intermitente
+3. Se asignan suplementos según los resultados del test y preguntas del cuestionario
+4. Se asigna un plan de alimentación específico (Fase 1, Fase 1.0, etc. o Fase 27 para intestino) - La duración del protocolo es de dos meses
+5. Se recomienda un segundo test para validar resultados y ajustar el plan
+
+## Cuestionario general para despues de un test
+Preguntas para cualquier paciente haya salido positivo o negativo en el test.
+- ¿Qué objetivo y metas tienes al realizar este test?
+- ¿Tomas alguna medicina actualmente ?
+- ¿Cuál tomás y en qué momento del día lo consumes?
+- ¿Tienes buena calidad de sueño ?
+- ¿Cuántas horas duermes?
+- ¿Te cuesta trabajo generar sueño, estás despertando en la noche o ambas?
+- ¿Tienes energía durante el día del 1 al 5 siendo el cinco mayor que tanta energía tienes?
+- ¿Te despiertas cansado o la energía se va terminando en el día?
+- ¿Te sientes irritable de mal humor en el día a día con poca tolerancia?
+- ¿Tienes buen dinamismo mental, lucidez o se te están olvidando las cosas, te cuesta trabajo concentrarte, niebla mental?
+- ¿Estrés laboral o personal del 1 al 5 cuánto tienes, siendo el 5 el mayor qué tanto estrés tienes?
+- ¿A qué hora es tu último alimento del día ?
+- ¿A qué hora es tu primer alimento del día?
+- ¿Que seria mas facil para ti dejar de cenar o desayunar?
+- ¿Con que te sentiras mas agusto, un menú con opciones o una lista de alimentos?
+- ¿Que tan adicto estas a la azúcares del 1 al 5 siendo el cinco el mayor, carbohidratos(pan, pasta, tortilla, arroz, avena, frijoles, harinas, frutas, dulces, papitas, refrescos?
+- ¿Tienes buena digestión?
+- ¿Te inflamas de tu estómago regularmente?
+- ¿Cómo son tus heces fecales? (tiritas delgadas, bolitas, pedaceria, líquido, troncos grueso normales como una salchicha)
+- ¿Cuántas veces comes en el día contando snack o entrecomidas?
+- ¿Consideras que masticas bien la comida?
+- ¿Qué más has intentado para bajar de peso?
+- ¿Por qué abandonan las dietas?
+- ¿Cómo podríamos hacer este proceso más facil para ti?
+- ¿Descríbeme un desayuno, comida, snack o entre comidas y cena típico en ti?
+- ¿Practicas alguna actividad física regularmente?
+- ¿Notas que se está oscureciendo alguna parte de tu cuerpo como cuello, entrepiernas, axilas?
+- ¿Fumas?
+- ¿Si fumas, cuántos cigarros al día?
+- ¿Consumes alcohol?
+- ¿Realizas alguna actividad física?
+- ¿Algún dato o tema que consideres relevante que yo sepa y quieras comentarme?
+
+
+## Ayuno (indicar siempre a todos)
+- Ayuno mínimo de 14 horas máximo 16 horas.
+- Es mejor dejar de cenar que desayunar pero adaptamos al paciente a su estilo de vida y sensaciones.
+- Se tiene que hacer minimo 6 dias a la semana
+- Siempre se debe romper el ayuno con lo que está marcado en tu plan de nutrición.
+- Durante el ayuno solo se puede tomar, te verde, cafe negro y agua, cualquier de los 3 sin leche, ningun tipo de azucar, splenda etc.
+- Los suplementos indicados no rompen el ayuno.
+
+
+
+## Suplementos
+
+## Test de prevención diabetes e infartos al corazón. 
+Indicaciones solo para cuando el paciente se haya hecho el Test de prevención diabetes e infartos al corazón. 
+
+Suplementos de prevencion de diabetes o para diabeticos
+- Berberina 500 mg por la noche
+- Inositol 500 mg por la noche
+- L- Taurina 500 mg en ayunas
+- Cromo 200 mcg en ayunas
+
+Suplementos de prevencion de infartos al corazón 
+- L-Arginina 1000 mg
+- Coenzima Q10 200 mg
+- Omega 3 mayor concentración de EPA Y DHA 1000 mg
+
+Proyecto de nutricion
+- El plan de alimentación que va es: Fase 1 (menú) o Fase 1.000 (lista de alimentos)
+  Enlace a Fase 1: https://drive.google.com/file/d/19GsDV1AQ0eX7MnM9qsQ69d1r9QX5yWcj/view?usp=sharing
+  Enlace a Fase 1.000: https://drive.google.com/file/d/1mvisfBqF2_D01ZAHFzu1ToHpBbTwm5OB/view?usp=sharing
+- El plan Fase 1.0 (menú) o Fase 1.00 (lista de alimentos) va si los veo muy adictos al azúcar y carbohidratos.
+  Enlace a Fase 1.0: https://drive.google.com/file/d/1Rh_Feo1n95nbJZFRy2Tnz9W4inUaEzmK/view?usp=sharing
+  Enlace a Fase 1.00: https://drive.google.com/file/d/1ffQhwQ-APqrVZjlC1IAORyk-AWafm_0v/view?usp=sharing
+
+
+Detox general
+- Jugos de desintoxicación: 
+1. Tomar un vaso con jugo de apio realizado en extractor con poquita curcuma en polvo, un diente de jengibre molido y el jugo de un limón. Te lo tomas para romper tu ayuno. A los 30 min tomar en vaso con dos cucharadas soperas de aceite de oliva con el jugo de un limón. Esto por un mes 
+2. Un manojo de cilantro (hacer presión para que quepa bastante) • 5 cm de jengibre fresco • 4 limones (sin cáscara) • Un pepino grandes (sin cáscara ) • 1 manzana verde, retirar las semillas. Todo en la licuadora con agua al gusto. Esto en ayunas por un mes
+- Glutation 500 mg en la noche
+- Complejo b en ayunas
+
+Suplementos solo si menciona en el cuestionario que duerme mal:
+- Magnesio tipo glicinato 400 mg por la noche
+- Ashwagandha 500 mg por la noche
+
+
+
+## Test antiinflamatorio-segundo cerebro - intestino. 
+Indicaciones solo para cuando el paciente se haya hecho el Test antiinflamatorio-segundo cerebro - intestino. 
+
+Suplementos de prevencion 
+- L-Glutamina 500 mg en ayunas
+- Probiótico con la cepa Saccharomyce Boulardii en la noche
+- Probiótico con la cepa Bifidobacterium en la noche
+- Betaína 600 mg en ayunas
+
+Suplementos solo si sale positivo en alguna o todas las pruebas (calprotectina y H. pylori)
+- Desparasitante (oxal, Loxe, vermox, una sola toma)
+- Cucharada de vinagre de manzana en ayunas (bacterias)
+- Curcuma en capsulas 300 mg (bacterias)
+- Suplementos de ajo negro 500mg (parásitos, esporas, señales viales, señales post virales)
+- Suplemento capsulas jengibre 500 mg (señales virales y post virales)
+- Semillas de calabaza (parásitos) comer un puño.
+- Cucharada de aceite de coco (parásitos)
+- Orégano 500 mg
+
+Proyecto de nutricion
+- Primer mes: Fase 27 
+  Enlace a Fase 27: https://drive.google.com/file/d/1ZFIrn0U-oWk45UxAyV44tD2SnPhzISqe/view?usp=sharing
+- Segundo mes: Fase 1 (menú) o Fase 1.000 (lista de alimentos)
+  Enlace a Fase 1: https://drive.google.com/file/d/19GsDV1AQ0eX7MnM9qsQ69d1r9QX5yWcj/view?usp=sharing
+  Enlace a fase 1.000: https://drive.google.com/file/d/1mvisfBqF2_D01ZAHFzu1ToHpBbTwm5OB/view?usp=sharing
+
+Detox general
+- Jugos de desintoxicación: 
+1. Tomar un vaso con jugo de apio realizado en extractor con poquita curcuma en polvo, un diente de jengibre molido y el jugo de un limón. Te lo tomas para romper tu ayuno. A los 30 min tomar en vaso con dos cucharadas soperas de aceite de oliva con el jugo de un limón. Esto por un mes 
+2. Un manojo de cilantro (hacer presión para que quepa bastante) • 5 cm de jengibre fresco • 4 limones (sin cáscara) • Un pepino grandes (sin cáscara ) • 1 manzana verde, retirar las semillas. Todo en la licuadora con agua al gusto. Esto en ayunas por un mes
+- Glutation 500 mg en la noche
+- Complejo b en ayunas
+
+Suplementos solo si menciona en el cuestionario que duerme mal:
+- Magnesio tipo glicinato 400 mg por la noche
+- Ashwagandha 500 mg por la noche
+
+
+
+
+
+
+
+
+
+
+### Test perdida de peso (Mujer)  
+Indicaciones solo para cuando el paciente se haya hecho el Test perdida de peso (Mujer)  
+
+Suplementos de prevencion
+- BCAA, sin azúcar después de tu primer alimento.
+- Cromo 200 mcg en ayunas
+- Acido alfa lipoico 500 mg
+
+Proyecto de nutricion
+- El plan de alimentación que va es: Fase 1 (menú) o Fase 1.000 (lista de alimentos)
+  Enlace a Fase 1: https://drive.google.com/file/d/19GsDV1AQ0eX7MnM9qsQ69d1r9QX5yWcj/view?usp=sharing
+  Enlace a Fase 1.000: https://drive.google.com/file/d/1mvisfBqF2_D01ZAHFzu1ToHpBbTwm5OB/view?usp=sharing
+- El plan Fase 1.0 (menú) o Fase 1.00 (lista de alimentos) va si los veo muy adictos al azúcar y carbohidratos.
+  Enlace a Fase 1.0: https://drive.google.com/file/d/1Rh_Feo1n95nbJZFRy2Tnz9W4inUaEzmK/view?usp=sharing
+  Enlace a Fase 1.00: https://drive.google.com/file/d/1ffQhwQ-APqrVZjlC1IAORyk-AWafm_0v/view?usp=sharing
+
+Detox general
+- Jugos de desintoxicación: 
+1. Tomar un vaso con jugo de apio realizado en extractor con poquita curcuma en polvo, un diente de jengibre molido y el jugo de un limón. Te lo tomas para romper tu ayuno. A los 30 min tomar en vaso con dos cucharadas soperas de aceite de oliva con el jugo de un limón. Esto por un mes 
+2. Un manojo de cilantro (hacer presión para que quepa bastante) • 5 cm de jengibre fresco • 4 limones (sin cáscara) • Un pepino grandes (sin cáscara ) • 1 manzana verde, retirar las semillas. Todo en la licuadora con agua al gusto. Esto en ayunas por un mes
+- Glutation 500 mg en la noche
+- Complejo b en ayunas
+
+Sumplementos solo si sale positivo en la prueba de TSH:
+- Yodo liquido 3 gotas
+- Selenio 200 mcg
+- L-Tirosina 500 mg
+- Vitamina d 5000 IU
+
+Suplementos solo si menciona en el cuestionario que duerme mal:
+- Magnesio tipo glicinato 400 mg por la noche
+- Ashwagandha 500 mg por la noche
+
+
+## Test perdida de peso (Hombre)
+Indicaciones solo para cuando el paciente se haya hecho el Test perdida de peso (Hombre)  
+
+Suplementos de prevencion
+- BCAA, sin azúcar después de tu primer alimento.
+- Cromo 200 mcg en ayunas
+- Acido alfa lipoico 500 mg
+
+Proyecto de nutricion
+- El plan de alimentación que va es: Fase 1 (menú) o Fase 1.000 (lista de alimentos)
+  Enlace a Fase 1: https://drive.google.com/file/d/19GsDV1AQ0eX7MnM9qsQ69d1r9QX5yWcj/view?usp=sharing
+  Enlace a Fase 1.000: https://drive.google.com/file/d/1mvisfBqF2_D01ZAHFzu1ToHpBbTwm5OB/view?usp=sharing
+- El plan Fase 1.0 (menú) o Fase 1.00 (lista de alimentos) va si los veo muy adictos al azúcar y carbohidratos.
+  Enlace a Fase 1.0: https://drive.google.com/file/d/1Rh_Feo1n95nbJZFRy2Tnz9W4inUaEzmK/view?usp=sharing
+  Enlace a Fase 1.00: https://drive.google.com/file/d/1ffQhwQ-APqrVZjlC1IAORyk-AWafm_0v/view?usp=sharing
+
+Detox general
+- Jugos de desintoxicación: 
+1. Tomar un vaso con jugo de apio realizado en extractor con poquita curcuma en polvo, un diente de jengibre molido y el jugo de un limón. Te lo tomas para romper tu ayuno. A los 30 min tomar en vaso con dos cucharadas soperas de aceite de oliva con el jugo de un limón. Esto por un mes 
+2. Un manojo de cilantro (hacer presión para que quepa bastante) • 5 cm de jengibre fresco • 4 limones (sin cáscara) • Un pepino grandes (sin cáscara ) • 1 manzana verde, retirar las semillas. Todo en la licuadora con agua al gusto. Esto en ayunas por un mes
+- Glutation 500 mg en la noche
+- Complejo b en ayunas
+
+Sumplementos solo si sale positivo en la prueba albúmina
+- Liverheal de Adapto Heal
+
+Suplementos solo si menciona en el cuestionario que duerme mal:
+- Magnesio tipo glicinato 400 mg por la noche
+- Ashwagandha 500 mg por la noche
+
+
+
+
+## Test Epigenetico
+Indicaciones solo para cuando el paciente se haya hecho el Test Epigenetico
+
+Suplementos recomendados
+Revisar el documento y consumir los recomendados por el test: https://drive.google.com/file/d/1iAQZPe7HlLnuXQiRkUoRYHXPSfm9Tmt-/view?usp=sharing
+
+Proyecto de nutricion
+- El plan de alimentación que va es: Fase 1 (menú) o Fase 1.000 (lista de alimentos)
+  Enlace a Fase 1: https://drive.google.com/file/d/19GsDV1AQ0eX7MnM9qsQ69d1r9QX5yWcj/view?usp=sharing
+  Enlace a Fase 1.000: https://drive.google.com/file/d/1mvisfBqF2_D01ZAHFzu1ToHpBbTwm5OB/view?usp=sharing
+- El plan Fase 1.0 (menú) o Fase 1.00 (lista de alimentos) va si los veo muy adictos al azúcar y carbohidratos.
+  Enlace a Fase 1.0: https://drive.google.com/file/d/1Rh_Feo1n95nbJZFRy2Tnz9W4inUaEzmK/view?usp=sharing
+  Enlace a Fase 1.00: https://drive.google.com/file/d/1ffQhwQ-APqrVZjlC1IAORyk-AWafm_0v/view?usp=sharing
+
+Detox general
+- Jugos de desintoxicación: 
+1. Tomar un vaso con jugo de apio realizado en extractor con poquita curcuma en polvo, un diente de jengibre molido y el jugo de un limón. Te lo tomas para romper tu ayuno. A los 30 min tomar en vaso con dos cucharadas soperas de aceite de oliva con el jugo de un limón. Esto por un mes 
+2. Un manojo de cilantro (hacer presión para que quepa bastante) • 5 cm de jengibre fresco • 4 limones (sin cáscara) • Un pepino grandes (sin cáscara ) • 1 manzana verde, retirar las semillas. Todo en la licuadora con agua al gusto. Esto en ayunas por un mes
+- Glutation 500 mg en la noche
+
+Suplementos solo si menciona en el cuestionario que duerme mal:
+- Magnesio tipo glicinato 400 mg por la noche
+- Ashwagandha 500 mg por la noche
+
+"""
+
+# ==================== REMINDER EMOJIS AND NICKNAMES ====================
+# Map of reminder types to emojis for better visual representation
+REMINDER_EMOJIS = {
+    "water": "💧",
+    "supplement": "💊",
+    "sleep": "😴",
+    "meditation": "🧘",
+    "exercise": "🏃",
+    "appointment": "📅",
+    "medicine": "🩺",
+    "meal": "🍽️",
+    "custom": "🔔"
+}
+
+# List of adjectives and nouns to create friendly reminder nicknames
+REMINDER_ADJECTIVES = [
+    "Brillante", "Saludable", "Vital", "Energético", "Radiante", 
+    "Poderoso", "Renovador", "Equilibrado", "Armónico", "Óptimo"
+]
+
+REMINDER_NOUNS = [
+    "Recordatorio", "Aviso", "Alarma", "Alerta", "Notificación",
+    "Mensaje", "Ayudante", "Asistente", "Compañero", "Guía"
+]
+
+def generate_reminder_nickname():
+    """Generate a friendly nickname for a reminder"""
+    adjective = random.choice(REMINDER_ADJECTIVES)
+    noun = random.choice(REMINDER_NOUNS)
+    return f"{adjective} {noun}"
+
+# ==================== SUPABASE CHAT HISTORY FUNCTIONS ====================
+
+def save_message_to_supabase(user_phone: str, role: str, content: str, session_id: str = None):
+    """Guardar mensaje en el historial de Supabase"""
+    if not supabase:
+        logger.error("Supabase not initialized")
+        return None
+        
+    try:
+        result = supabase.table("chat_history").select("message_order").eq("user_phone", user_phone).order("message_order", desc=True).limit(1).execute()
+        
+        next_order = 1
+        if result.data:
+            next_order = result.data[0]["message_order"] + 1
+        
+        message_data = {
+            "user_phone": user_phone,
+            "role": role,
+            "content": content,
+            "message_order": next_order,
+            "session_id": session_id or f"session_{user_phone}_{int(time.time())}"
+        }
+        
+        insert_result = supabase.table("chat_history").insert(message_data).execute()
+        
+        if insert_result.data:
+            logger.info(f"Message saved for {user_phone}: {role} - {content[:50]}...")
+            return insert_result.data[0]["id"]
+        else:
+            logger.error(f"Failed to save message: {insert_result}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error saving message to Supabase: {str(e)}")
+        return None
+
+def get_chat_history_from_supabase(user_phone: str, limit: int = 20):
+    """Obtener historial de chat desde Supabase"""
+    if not supabase:
+        return []
+        
+    try:
+        result = supabase.table("chat_history").select("role, content, timestamp, message_order").eq("user_phone", user_phone).order("message_order", desc=True).limit(limit).execute()
+        
+        if result.data:
+            messages = result.data[::-1]
+            formatted_history = []
+            for msg in messages:
+                formatted_history.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            
+            logger.info(f"Loaded {len(formatted_history)} messages for {user_phone}")
+            return formatted_history
+        else:
+            logger.info(f"No chat history found for {user_phone}")
+            return []
+            
+    except Exception as e:
+        logger.error(f"Error loading chat history from Supabase: {str(e)}")
+        return []
+
+def initialize_user_chat(user_phone: str):
+    """Inicializar chat para nuevo usuario"""
+    existing_history = get_chat_history_from_supabase(user_phone, limit=1)
+    
+    if not existing_history:
+        welcome_message = "¡Hola! Soy Noa, tu asistente personal de Epigen. ¿Cómo puedo ayudarte hoy? 🧬\n\nTambién puedo configurar recordatorios automáticamente. Solo dime qué quieres recordar y yo me encargo del resto."
+        
+        save_message_to_supabase(user_phone, "assistant", welcome_message)
+        logger.info(f"Initialized new chat for {user_phone}")
+        
+        return [{"role": "assistant", "content": welcome_message}]
+    else:
+        return existing_history
+
+def get_user_stats(user_phone: str):
+    """Obtener estadísticas del usuario"""
+    if not supabase:
+        return {}
+        
+    try:
+        message_count_result = supabase.table("chat_history").select("id", count="exact").eq("user_phone", user_phone).execute()
+        first_message_result = supabase.table("chat_history").select("created_at").eq("user_phone", user_phone).order("message_order", desc=False).limit(1).execute()
+        last_message_result = supabase.table("chat_history").select("created_at").eq("user_phone", user_phone).order("message_order", desc=True).limit(1).execute()
+        
+        stats = {
+            "total_messages": message_count_result.count or 0,
+            "first_interaction": first_message_result.data[0]["created_at"] if first_message_result.data else None,
+            "last_interaction": last_message_result.data[0]["created_at"] if last_message_result.data else None
+        }
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error getting user stats: {str(e)}")
+        return {}
+
+# ==================== SUPABASE REMINDERS FUNCTIONS WITH DECIMAL SUPPORT ====================
+
+#def save_reminder_supabase(user_phone: str, reminder_type: str, message: str, 
+#                          interval_minutes: float = None, cron_expression: str = None, 
+#                          nickname: str = None):
+#    """Guardar recordatorio en Supabase - VERSIÓN MEJORADA con soporte decimal completo y nicknames"""
+#    if not supabase:
+#        logger.error("Supabase not initialized")
+#        return None
+#        
+#    try:
+#        # Convertir a float y validar
+#        if interval_minutes is not None:
+#            interval_minutes = float(interval_minutes)
+#            # Validar que el intervalo sea razonable
+#            if interval_minutes <= 0:
+#                logger.error(f"Invalid interval_minutes: {interval_minutes}")
+#                return None
+#            # Redondear a 2 decimales para evitar problemas de precisión
+#            interval_minutes = round(interval_minutes, 2)
+#        
+#        # Generar nickname si no fue proporcionado
+#        if not nickname:
+#            nickname = generate_reminder_nickname()
+#        
+#        data = {
+#            "user_phone": user_phone,
+#            "reminder_type": reminder_type,
+#            "message": message,
+#            "interval_minutes": interval_minutes,
+#            "cron_expression": cron_expression,
+#            "is_active": True,
+#            "timezone": "America/Mexico_City",
+#            "nickname": nickname
+#        }
+#        
+#        logger.info(f"Attempting to save reminder with interval_minutes: {interval_minutes} (type: {type(interval_minutes)})")
+#        
+#        result = supabase.table("reminders").insert(data).execute()
+#        
+#        if result.data:
+#            logger.info(f"Reminder saved successfully for {user_phone}: {reminder_type} - {interval_minutes} minutes")
+#            return result.data[0]["id"]
+#        else:
+#            logger.error(f"Failed to save reminder - Supabase response: {result}")
+#            return None
+#            
+#    except Exception as e:
+#        logger.error(f"Error saving reminder to Supabase: {str(e)}")
+#        logger.error(f"Data attempted to save: {data if 'data' in locals() else 'N/A'}")
+#        return None
+
+def save_reminder_supabase(user_phone: str, reminder_type: str, message: str, 
+                          interval_minutes: float = None, cron_expression: str = None, 
+                          nickname: str = None):
+    """Guardar recordatorio en Supabase - VERSIÓN COMPATIBLE con bases de datos existentes"""
+    if not supabase:
+        logger.error("Supabase not initialized")
+        return None
+        
+    try:
+        # Convertir a float y validar
+        if interval_minutes is not None:
+            interval_minutes = float(interval_minutes)
+            # Validar que el intervalo sea razonable
+            if interval_minutes <= 0:
+                logger.error(f"Invalid interval_minutes: {interval_minutes}")
+                return None
+            # Redondear a 2 decimales para evitar problemas de precisión
+            interval_minutes = round(interval_minutes, 2)
+        
+        # Preparar datos básicos (sin nickname)
+        data = {
+            "user_phone": user_phone,
+            "reminder_type": reminder_type,
+            "message": message,
+            "interval_minutes": interval_minutes,
+            "cron_expression": cron_expression,
+            "is_active": True,
+            "timezone": "America/Mexico_City"
+        }
+        
+        # Intentar añadir nickname solo si la columna existe
+        try:
+            # Primero verificamos si la columna existe
+            check_column = supabase.table("reminders").select("count(*)").limit(1).execute()
+            if nickname:
+                data["nickname"] = nickname
+        except Exception as column_error:
+            logger.warning(f"Nickname column might not exist, continuing without it: {column_error}")
+        
+        logger.info(f"Attempting to save reminder with interval_minutes: {interval_minutes} (type: {type(interval_minutes)})")
+        
+        result = supabase.table("reminders").insert(data).execute()
+        
+        if result.data:
+            logger.info(f"Reminder saved successfully for {user_phone}: {reminder_type} - {interval_minutes} minutes")
+            return result.data[0]["id"]
+        else:
+            logger.error(f"Failed to save reminder - Supabase response: {result}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error saving reminder to Supabase: {str(e)}")
+        logger.error(f"Data attempted to save: {data if 'data' in locals() else 'N/A'}")
+        return None
+
+def get_user_reminders_supabase(user_phone: str):
+    """Obtener recordatorios de un usuario específico"""
+    if not supabase:
+        return []
+        
+    try:
+        result = supabase.table("reminders").select("*").eq("user_phone", user_phone).eq("is_active", True).execute()
+        
+        if result.data:
+            return result.data
+        else:
+            return []
+            
+    except Exception as e:
+        logger.error(f"Error getting user reminders: {str(e)}")
+        return []
+
+def deactivate_reminder_supabase(user_phone: str, reminder_id: int):
+    """Desactivar un recordatorio específico por ID"""
+    if not supabase:
+        return False
+        
+    try:
+        result = supabase.table("reminders").update({"is_active": False}).eq("user_phone", user_phone).eq("id", reminder_id).execute()
+        
+        if result.data:
+            logger.info(f"Deactivated reminder ID {reminder_id} for {user_phone}")
+            return True
+        else:
+            logger.warning(f"No reminder found to deactivate with ID {reminder_id} for {user_phone}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error deactivating reminder: {str(e)}")
+        return False
+
+def deactivate_reminder_by_type_supabase(user_phone: str, reminder_type: str):
+    """Desactivar recordatorios de un tipo específico para un usuario"""
+    if not supabase:
+        return False
+        
+    try:
+        result = supabase.table("reminders").update({"is_active": False}).eq("user_phone", user_phone).eq("reminder_type", reminder_type).execute()
+        
+        if result.data:
+            logger.info(f"Deactivated {reminder_type} reminders for {user_phone}")
+            return True
+        else:
+            logger.warning(f"No reminders found to deactivate for {user_phone}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error deactivating reminder: {str(e)}")
+        return False
+
+def load_reminders_supabase():
+    """Cargar todos los recordatorios activos desde Supabase"""
+    if not supabase:
+        return []
+        
+    try:
+        result = supabase.table("reminders").select("*").eq("is_active", True).execute()
+        
+        if result.data:
+            logger.info(f"Loaded {len(result.data)} active reminders from Supabase")
+            return result.data
+        else:
+            logger.info("No active reminders found in Supabase")
+            return []
+            
+    except Exception as e:
+        logger.error(f"Error loading reminders from Supabase: {str(e)}")
+        return []
+
+# ==================== IMPROVED INTENT DETECTION FUNCTIONS ====================
+
+def is_information_request(text: str) -> bool:
+    """Detectar si es una pregunta de información en lugar de un recordatorio"""
+    text_lower = text.lower().strip()
+    
+    # Patrones de preguntas informativas
+    info_patterns = [
+        # Preguntas directas sobre suplementos, salud, etc.
+        r"que (?:puedo )?(?:debo )?tomar para",
+        r"que (?:me )?recomiendas",
+        r"recomiendame",
+        r"(?:que|cuales) (?:son|hay|existen) (?:los|las)? (?:mejores|buenos)",
+        r"(?:que|cual) es (?:bueno|mejor|recomendable)",
+        r"(?:donde|como) (?:puedo|debo|tengo que)",
+        r"beneficios de",
+        r"ventajas de",
+        r"efectos de",
+        r"(?:opciones|alternativas) de",
+        
+        # Preguntas específicas de salud
+        r"(?:que|como) (?:puedo|debo) (?:hacer|tomar) para",
+        r"(?:que|como) (?:me )?ayuda con",
+        r"(?:que|cual) es (?:bueno|mejor|recomendable) para",
+        r"que puedo tomar\??$",  # Exactamente "que puedo tomar" con o sin signo
+        r"para que sirve",
+        r"como funciona",
+        r"efectos secundarios",
+        
+        # Preguntas sobre productos Epigen
+        r"test (?:de|para)",
+        r"prueba (?:de|para)",
+        r"(?:que|cuales) (?:son|hay|existen) (?:los|las)? (?:test|pruebas)",
+        r"(?:cuanto|precio|costo) (?:cuesta|vale|es)",
+        r"donde (?:compro|consigo|adquiero)",
+        
+        # Categorías generales
+        r"^(?:que|quien|cuando|donde|como|por que|porque|cual|cuales|cuanto|cuanta)",
+        r"me puedes (?:explicar|decir|contar|informar)",
+        r"informacion (?:sobre|acerca|de)",
+        r"datos (?:sobre|acerca|de)",
+    ]
+    
+    # Si coincide con algún patrón de pregunta informativa
+    for pattern in info_patterns:
+        if re.search(pattern, text_lower):
+            logger.info(f"Detected information request: '{text}'")
+            return True
+    
+    return False
+
+def is_specific_product_request(text: str) -> bool:
+    """Detectar si es una consulta sobre un producto o suplemento específico"""
+    text_lower = text.lower().strip()
+    
+    # Lista de suplementos y productos comunes
+    supplement_keywords = [
+        "magnesio", "glicinato", "zinc", "vitamina", "omega", "d3", "c", "b12",
+        "ashwagandha", "probiotico", "probiótico", "melatonina", "hierro", "calcio",
+        "selenio", "valeriana", "complejo b", "curcuma", "cúrcuma", "proteína", "proteina",
+        "colágeno", "colageno", "biotina", "creatina", "bcaa", "glutamina", "antioxidante"
+    ]
+    
+    # Lista de productos Epigen
+    epigen_products = [
+        "test", "prueba", "análisis", "analisis", "epigenético", "epigenetico",
+        "diabetes", "intestino", "inflamación", "inflamacion", "peso", "corazón", "corazon"
+    ]
+    
+    # Patrones para detectar consultas de productos
+    product_patterns = [
+        r"(?:donde|como) (?:compro|consigo|adquiero)",
+        r"(?:me )?recomiendas",
+        r"(?:que|cual) es (?:mejor|bueno|recomendable)",
+        r"(?:opciones|alternativas) de",
+        r"donde (?:hay|venden|consigo)",
+        r"(?:puedo|debo) tomar",
+        r"(?:para que|que) (?:sirve|es bueno)",
+        r"beneficios de",
+        r"efectos de",
+        r"información (?:sobre|de)",
+        r"más (?:información|detalles) (?:sobre|de)",
+    ]
+    
+    # Verificar si contiene alguna palabra clave de suplementos o productos
+    has_supplement = any(keyword in text_lower for keyword in supplement_keywords)
+    has_epigen_product = any(keyword in text_lower for keyword in epigen_products)
+    
+    # Verificar si coincide con algún patrón de consulta de producto
+    has_product_pattern = any(re.search(pattern, text_lower) for pattern in product_patterns)
+    
+    # Es una consulta de producto si tiene una palabra clave y un patrón de consulta
+    if (has_supplement or has_epigen_product) and has_product_pattern:
+        logger.info(f"Detected specific product request: '{text}'")
+        return True
+    
+    return False
+
+def parse_flexible_frequency(text: str):
+    """Detectar frecuencia de forma ultra-flexible con soporte decimal completo"""
+    import re
+    
+    # Patrones de tiempo más flexibles con soporte decimal
+    time_patterns = [
+        # Detección de "min" o "minuto" sin número (implica 1 minuto)
+        (r"cada\s*min(?:uto)?s?\b", lambda m: 1),
+        (r"por\s*min(?:uto)?s?\b", lambda m: 1),
+        (r"un\s*min(?:uto)?s?\b", lambda m: 1),
+        (r"1\s*min(?:uto)?s?\b", lambda m: 1),
+
+        # Segundos
+        (r"(\d+(?:\.\d+)?)\s*seg(?:undo)?s?", lambda m: float(m.group(1)) / 60),
+        (r"cada\s*(\d+(?:\.\d+)?)\s*seg(?:undo)?s?", lambda m: float(m.group(1)) / 60),
+        (r"(\d+(?:\.\d+)?)\s*s\b", lambda m: float(m.group(1)) / 60),  # "30s", "15.5s"
+        
+        # Minutos - muchas variaciones con decimales
+        (r"(\d+(?:\.\d+)?)\s*min(?:uto)?s?", lambda m: float(m.group(1))),
+        (r"cada\s*(\d+(?:\.\d+)?)\s*min(?:uto)?s?", lambda m: float(m.group(1))),
+        (r"(\d+(?:\.\d+)?)\s*m\b", lambda m: float(m.group(1))),  # "5m", "2.5m"
+        (r"cada\s*minuto", lambda m: 1),
+        (r"por\s*minuto", lambda m: 1),
+        (r"un\s*minuto", lambda m: 1),
+        (r"1\s*minuto", lambda m: 1),
+        
+        # Fracciones de minuto
+        (r"medio\s*minuto", lambda m: 0.5),
+        (r"30\s*segundos", lambda m: 0.5),
+        (r"15\s*segundos", lambda m: 0.25),
+        (r"45\s*segundos", lambda m: 0.75),
+        
+        # Horas - muchas variaciones con decimales
+        (r"(\d+(?:\.\d+)?)\s*h(?:ora)?s?", lambda m: float(m.group(1)) * 60),
+        (r"cada\s*(\d+(?:\.\d+)?)\s*h(?:ora)?s?", lambda m: float(m.group(1)) * 60),
+        (r"(\d+(?:\.\d+)?)\s*hr?s?", lambda m: float(m.group(1)) * 60),
+        (r"cada\s*hora", lambda m: 60),
+        (r"por\s*hora", lambda m: 60),
+        (r"una\s*hora", lambda m: 60),
+        (r"1\s*hora", lambda m: 60),
+        (r"cada\s*h", lambda m: 60),
+        
+        # Fracciones de hora
+        (r"media\s*hora", lambda m: 30),
+        (r"30\s*min(?:uto)?s?", lambda m: 30),
+        (r"cuarto\s*de\s*hora", lambda m: 15),
+        (r"15\s*min(?:uto)?s?", lambda m: 15),
+        (r"tres\s*cuartos\s*de\s*hora", lambda m: 45),
+        (r"45\s*min(?:uto)?s?", lambda m: 45),
+        
+        # Expresiones más naturales
+        (r"muy\s*seguido", lambda m: 15),  # cada 15 minutos
+        (r"seguido", lambda m: 30),       # cada 30 minutos
+        (r"frecuente", lambda m: 30),
+        (r"constantemente", lambda m: 15),
+        (r"todo\s*el\s*tiempo", lambda m: 10),
+        (r"siempre", lambda m: 30),
+        
+        # Veces por período con decimales
+        (r"dos\s*veces\s*(?:por\s*)?(?:al\s*)?día", lambda m: 12 * 60),    # cada 12 horas
+        (r"tres\s*veces\s*(?:por\s*)?(?:al\s*)?día", lambda m: 8 * 60),     # cada 8 horas
+        (r"cuatro\s*veces\s*(?:por\s*)?(?:al\s*)?día", lambda m: 6 * 60),   # cada 6 horas
+        (r"seis\s*veces\s*(?:por\s*)?(?:al\s*)?día", lambda m: 4 * 60),     # cada 4 horas
+        (r"una\s*vez\s*(?:por\s*)?(?:al\s*)?día", lambda m: 24 * 60),       # cada 24 horas
+        
+        # Números escritos con decimales
+        (r"cada\s*dos\s*h(?:ora)?s?", lambda m: 2 * 60),
+        (r"cada\s*tres\s*h(?:ora)?s?", lambda m: 3 * 60),
+        (r"cada\s*cuatro\s*h(?:ora)?s?", lambda m: 4 * 60),
+        (r"cada\s*cinco\s*h(?:ora)?s?", lambda m: 5 * 60),
+        (r"cada\s*seis\s*h(?:ora)?s?", lambda m: 6 * 60),
+        
+        # Casos especiales comunes
+        (r"a\s*cada\s*rato", lambda m: 30),
+        (r"de\s*vez\s*en\s*cuando", lambda m: 2 * 60),  # cada 2 horas
+        (r"regularmente", lambda m: 60),
+        (r"periódicamente", lambda m: 60),
+    ]
+    
+    # Buscar patrones
+    for pattern, extractor in time_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            result = extractor(match)
+            logger.info(f"Frequency pattern matched: '{pattern}' -> {result} minutes")
+            return result
+    
+    # Default: cada hora
+    logger.info("No specific frequency found, defaulting to 60 minutes")
+    return 60
+
+def parse_flexible_times(text: str):
+    """Detectar horarios de forma ultra-flexible"""
+    import re
+    
+    times_found = []
+    
+    # Patrones de horarios específicos
+    time_patterns = [
+        # Horarios exactos
+        r"(\d{1,2}):(\d{2})",  # 08:30, 14:15
+        r"a\s*las\s*(\d{1,2}):?(\d{2})?",  # a las 8, a las 8:30
+        r"(\d{1,2})\s*(?:am|pm)",  # 8am, 2pm
+        
+        # Expresiones de tiempo
+        r"mañana",
+        r"desayun",
+        r"por\s*la\s*mañana",
+        r"en\s*la\s*mañana",
+        
+        r"mediodía",
+        r"medio\s*día",
+        r"almuerz",
+        r"comer",
+        r"comida",
+        
+        r"tarde",
+        r"por\s*la\s*tarde",
+        r"en\s*la\s*tarde",
+        
+        r"noche",
+        r"por\s*la\s*noche", 
+        r"en\s*la\s*noche",
+        r"cenar",
+        r"cena",
+        r"antes\s*de\s*dormir",
+        r"antes\s*de\s*acostar"
+    ]
+    
+    for pattern in time_patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches:
+            matched_text = match.group().lower()
+            
+            if re.match(r"\d{1,2}:\d{2}", matched_text):
+                times_found.append(matched_text)
+            elif "mañana" in matched_text or "desayun" in matched_text:
+                times_found.append("08:00")
+            elif "mediodía" in matched_text or "almuerz" in matched_text or "comer" in matched_text:
+                times_found.append("12:00")
+            elif "tarde" in matched_text:
+                times_found.append("15:00")
+            elif "noche" in matched_text or "cenar" in matched_text or "dormir" in matched_text or "acostar" in matched_text:
+                times_found.append("20:00")
+            elif re.match(r"a\s*las\s*(\d{1,2})", matched_text):
+                hour_match = re.search(r"(\d{1,2})", matched_text)
+                if hour_match:
+                    hour = int(hour_match.group(1))
+                    times_found.append(f"{hour:02d}:00")
+    
+    # Eliminar duplicados manteniendo el orden
+    unique_times = []
+    for time in times_found:
+        if time not in unique_times:
+            unique_times.append(time)
+    
+    # Si no se encontraron horarios específicos, usar defaults
+    if not unique_times:
+        unique_times = ["08:00", "20:00"]
+    
+    logger.info(f"Times detected: {unique_times}")
+    return unique_times
+
+def detect_reminder_type(text: str):
+    """Detectar el tipo de recordatorio de forma mejorada"""
+    text_lower = text.lower().strip()
+    
+    # Patrones para cada tipo de recordatorio
+    reminder_types = {
+        "water": [
+            "agua", "h2o", "hidrat", "beber", "bebe", "tomar agua", "toma agua",
+            "líquido", "liquido", "fluido", "sed", "hidratar", "hidratarme"
+        ],
+        "sleep": [
+            "dormir", "sueño", "descansar", "descanso", "cama", "acostar", "acuest",
+            "soñar", "hora de dormir", "ir a dormir", "ir a la cama", "hora de descansar"
+        ],
+        "meditation": [
+            "meditar", "meditación", "meditacion", "mindfulness", "respirar", "respira",
+            "relajar", "relaja", "calmar", "calma", "paz", "tranquil", "atencion plena"
+        ],
+        "exercise": [
+            "ejercicio", "entrenar", "entreno", "entrenamient", "gimnasio", "gym", 
+            "correr", "trotar", "caminar", "estirar", "estiramiento", "yoga", "pilates"
+        ],
+        "meal": [
+            "comer", "comida", "almorzar", "almuerzo", "cenar", "cena", "desayunar", 
+            "desayuno", "merienda", "refrigerio", "snack", "alimento"
+        ],
+        "appointment": [
+            "cita", "reunión", "reunion", "consulta", "visita", "médico", "medico", 
+            "doctor", "dentista", "terapia", "fisio", "trabajo", "evento"
+        ]
+    }
+    
+    # Comprobar coincidencias con cada tipo
+    for reminder_type, keywords in reminder_types.items():
+        if any(keyword in text_lower for keyword in keywords):
+            logger.info(f"Detected reminder type: {reminder_type}")
+            return reminder_type
+    
+    # Comprobar si es un medicamento o suplemento
+    supplement_keywords = [
+        "pastilla", "capsula", "tableta", "suplemento", "vitamina", "medicamento", 
+        "píldora", "medicina", "dosis", "tratamiento", "medicación", "medicacion",
+        "cápsula", "remedio", "jarabe", "gotas", "inyección", "inyeccion"
+    ]
+    
+    if any(keyword in text_lower for keyword in supplement_keywords):
+        logger.info(f"Detected reminder type: supplement")
+        return "supplement"
+    
+    # Default a supplement si se menciona un nombre de suplemento específico
+    supplement_names = [
+        "magnesio", "zinc", "selenio", "vitamina", "omega", "hierro", "calcio",
+        "ashwagandha", "probiótico", "melatonina", "b12", "d3", "c", "biotina"
+    ]
+    
+    if any(name in text_lower for name in supplement_names):
+        logger.info(f"Detected supplement name in: {text}")
+        return "supplement"
+    
+    # Si no hay coincidencias claras pero parece un recordatorio, usar tipo personalizado
+    logger.info(f"No specific reminder type detected, using custom type")
+    return "custom"
+
+def parse_flexible_supplement(text: str):
+    """Detectar suplemento/medicamento de forma ultra-flexible con soporte de intervalos"""
+    import re
+    
+    result = {
+        "found": False,
+        "name": "",
+        "times": [],
+        "use_interval": False,  # NUEVO: para detectar si usar intervalo en lugar de horarios
+        "interval_minutes": 60  # NUEVO: intervalo por defecto
+    }
+    
+    # Detectar si se menciona una frecuencia en lugar de horarios específicos
+    frequency_indicators = [
+        "cada", "por", "frecuente", "seguido", "veces", "minuto", "hora", "segundo"
+    ]
+    
+    has_frequency = any(indicator in text.lower() for indicator in frequency_indicators)
+    
+    # Patrones para extraer nombres de suplementos/medicamentos
+    supplement_patterns = [
+        # Formas directas
+        r"(?:tomar|toma|beber|consume|consumir)\s+(?:el\s+|la\s+|mi\s+|mis\s+)?(\w+)",
+        r"(?:recordar|recuerda|recuerdame)\s+(?:que\s+)?(?:tome|tomar|beber|consumir)\s+(?:el\s+|la\s+|mi\s+|mis\s+)?(\w+)",
+        r"(?:quiero|necesito)\s+(?:que\s+me\s+)?(?:recuerdes?)\s+(?:que\s+)?(?:tome|tomar)\s+(?:el\s+|la\s+|mi\s+|mis\s+)?(\w+)",
+        
+        # Con palabras clave específicas
+        r"(?:pastilla|capsula|tableta|suplemento|vitamina|medicamento|medicina|píldora)\s+(?:de\s+)?(\w+)",
+        r"(\w+)\s+(?:pastilla|capsula|tableta|suplemento|vitamina|medicamento|medicina|píldora)",
+        
+        # Formas más naturales
+        r"(?:el|la|mi|mis)\s+(\w+)",  # "mi magnesio", "la vitamina"
+        r"recordatorio\s+(?:para\s+|de\s+)?(?:el\s+|la\s+|mi\s+|mis\s+)?(\w+)",
+    ]
+    
+    # Lista de suplementos/medicamentos comunes para validar
+    valid_supplements = [
+        "magnesio", "vitamina", "omega", "calcio", "hierro", "zinc", "selenio",
+        "b12", "d3", "c", "biotina", "colageno", "colágeno", "probiotico", "probiótico",
+        "melatonina", "ashwagandha", "curcuma", "cúrcuma", "jengibre", "ajo",
+        "metformina", "losartan", "atorvastatina", "omeprazol", "ibuprofeno",
+        "paracetamol", "aspirina", "simvastatina", "enalapril", "metroprolol",
+        "levotiroxina", "insulina", "gabapentina", "lisinopril", "amlodipino"
+    ]
+    
+    for pattern in supplement_patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches:
+            potential_name = match.group(1).lower()
+            
+            # Filtrar palabras que no son suplementos
+            exclude_words = [
+                "agua", "que", "me", "de", "el", "la", "mi", "mis", "un", "una",
+                "recordar", "tomar", "beber", "hora", "horas", "minuto", "minutos",
+                "dia", "día", "noche", "mañana", "tarde", "vez", "veces", "tiempo",
+                "cuando", "donde", "como", "cómo", "para", "por", "con", "sin",
+                "recordatorio", "recordatorios", "medicina", "medicamento", "pastilla"
+            ]
+            
+            if (len(potential_name) >= 3 and 
+                potential_name not in exclude_words and
+                potential_name.isalpha()):
+                
+                # Validar si es un suplemento conocido o si al menos se parece a uno
+                is_valid = (potential_name in valid_supplements or 
+                           any(sup in potential_name for sup in valid_supplements) or
+                           len(potential_name) >= 4)  # Nombres largos probablemente son válidos
+                
+                if is_valid:
+                    result["found"] = True
+                    result["name"] = potential_name.title()
+                    
+                    # NUEVO: Decidir si usar intervalo o horarios específicos
+                    if has_frequency:
+                        result["use_interval"] = True
+                        result["interval_minutes"] = parse_flexible_frequency(text)
+                        logger.info(f"Supplement with interval detected: {result['name']} every {result['interval_minutes']} minutes")
+                    else:
+                        result["use_interval"] = False
+                        result["times"] = parse_flexible_times(text)
+                        logger.info(f"Supplement with specific times detected: {result['name']} at {result['times']}")
+                    
+                    break
+    
+    return result
+
+def parse_reminder_request(text: str, user_phone: str):
+    """
+    VERSIÓN ULTRA-FLEXIBLE MEJORADA: Analizar texto del usuario para extraer información de recordatorios.
+    Detecta prácticamente cualquier forma de pedir recordatorios con soporte para distintos tipos.
+    """
+    text_lower = text.lower().strip()
+    
+    # Primero verificamos si es una pregunta informativa en lugar de un recordatorio
+    if is_information_request(text_lower) and not "recuerd" in text_lower:
+        logger.info(f"Detected information request rather than reminder: '{text}'")
+        return None
+    
+    # Limpiar texto de signos de puntuación innecesarios
+    import string
+    text_clean = text_lower.translate(str.maketrans('', '', '¿¡'))
+    
+    logger.info(f"Parsing FLEXIBLE reminder request for {user_phone}: '{text}'")
+    
+    # MEGA LISTA de patrones para detectar solicitudes de recordatorio
+    reminder_patterns = [
+        # Verbos principales de recordatorio
+        r"record[aá]r[me]*",
+        r"recuerd[ae][me]*", 
+        r"que me recuerdes?",
+        r"quiero que me recuerdes?",
+        r"necesito que me recuerdes?",
+        r"me puedes recordar",
+        r"puedes recordar[me]*",
+        r"ayuda[me]* a recordar",
+        r"ayuda[me]* con recordar",
+        
+        # Configuración/programación
+        r"configur[ae] (?:un )?recordatorio",
+        r"program[ae] (?:un )?recordatorio", 
+        r"pon[me]* (?:un )?recordatorio",
+        r"crea (?:un )?recordatorio",
+        r"haz (?:un )?recordatorio",
+        r"activa (?:un )?recordatorio",
+        r"establece (?:un )?recordatorio",
+        
+        # Formas más casuales
+        r"avisa[me]*",
+        r"dime cuando",
+        r"notifica[me]*",
+        r"alerta[me]*",
+        r"recuerda[me]* que",
+        
+        # Expresiones con "quiero"
+        r"quiero (?:que )?(?:me )?(?:recuerdes?|recordatorios?)",
+        r"necesito (?:que )?(?:me )?(?:recuerdes?|recordatorios?)",
+        r"me gustaria (?:que )?(?:me )?recuerdes?",
+        r"quisiera (?:que )?(?:me )?recuerdes?",
+        
+        # Más variaciones naturales
+        r"no se me olvide",
+        r"para no olvidar",
+        r"que no se me pase",
+        r"estar al pendiente",
+        r"mantener[me]* al pendiente",
+    ]
+    
+    # Verificar si es una solicitud de recordatorio
+    is_reminder_request = False
+    for pattern in reminder_patterns:
+        if re.search(pattern, text_clean):
+            is_reminder_request = True
+            logger.info(f"Matched pattern: {pattern}")
+            break
+    
+    # También detectar por contexto (palabras relacionadas)
+    if not is_reminder_request:
+        context_words = [
+            "tomar", "toma", "beber", "bebe", "consumir", "consume",
+            "agua", "hidratar", "hidratarme", "hidratar me",
+            "pastilla", "pastillas", "capsula", "cápsulas", "tableta", "tabletas",
+            "suplemento", "suplementos", "vitamina", "vitaminas", "medicamento",
+            "cada", "a las", "por la", "en la", "todos los", "diario", "diariamente",
+            "dormir", "meditación", "meditacion", "ejercicio", "entrenar"
+        ]
+        
+        context_matches = sum(1 for word in context_words if word in text_clean)
+        if context_matches >= 2:  # Si tiene al menos 2 palabras relacionadas
+            is_reminder_request = True
+            logger.info(f"Detected by context: {context_matches} context words found")
+    
+    if not is_reminder_request:
+        logger.info(f"No reminder request detected in: '{text}'")
+        return None
+    
+    logger.info(f"FLEXIBLE reminder request detected! Analyzing: '{text}'")
+    
+    # Determinar el tipo de recordatorio
+    reminder_type = detect_reminder_type(text_clean)
+    
+    reminder_info = {
+        "type": reminder_type,
+        "interval_minutes": 60,  # Default: cada hora
+        "times": [],
+        "supplement_name": "",
+        "message": "",
+        "detected": True,
+        "nickname": generate_reminder_nickname()  # Generar un nickname amigable
+    }
+    
+    # Personalizar mensaje y comportamiento según el tipo
+    if reminder_type == "water":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud."
+        reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+        
+    elif reminder_type == "sleep":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud."
+        # Los recordatorios de sueño normalmente son a horas específicas
+        reminder_info["times"] = parse_flexible_times(text_clean)
+        if "22:00" not in reminder_info["times"] and "21:00" not in reminder_info["times"] and "23:00" not in reminder_info["times"]:
+            reminder_info["times"].append("22:00")  # Añadir 10pm por defecto para recordatorios de sueño
+        
+    elif reminder_type == "meditation":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración."
+        reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+        
+    elif reminder_type == "exercise":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día."
+        reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+        
+    elif reminder_type == "supplement":
+        supplement_info = parse_flexible_supplement(text_clean)
+        
+        if supplement_info["found"]:
+            reminder_info["supplement_name"] = supplement_info["name"]
+            reminder_info["message"] = f"{REMINDER_EMOJIS['supplement']} Es hora de tomar tu {supplement_info['name']}"
+            
+            # Usar intervalo o horarios específicos según lo detectado
+            if supplement_info["use_interval"]:
+                reminder_info["interval_minutes"] = supplement_info["interval_minutes"]
+                reminder_info["times"] = []  # No usar horarios específicos
+            else:
+                reminder_info["times"] = supplement_info["times"]
+                reminder_info["interval_minutes"] = None  # No usar intervalo
+        else:
+            # Si no se puede determinar el suplemento específico
+            reminder_info["supplement_name"] = "suplemento"  # Genérico
+            reminder_info["message"] = f"{REMINDER_EMOJIS['supplement']} Es hora de tomar tu suplemento"
+            reminder_info["times"] = parse_flexible_times(text_clean)
+    
+    elif reminder_type == "meal":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['meal']} ¡Es hora de alimentarte! Recuerda comer de forma balanceada."
+        reminder_info["times"] = ["08:00", "13:00", "19:00"]  # Horarios comunes de comida
+        
+    elif reminder_type == "appointment":
+        reminder_info["message"] = f"{REMINDER_EMOJIS['appointment']} Recordatorio de tu cita."
+        reminder_info["times"] = parse_flexible_times(text_clean)
+        
+    else:  # custom
+        reminder_info["message"] = f"{REMINDER_EMOJIS['custom']} Recordatorio personalizado"
+        # Intentar detectar si es basado en intervalo o en horarios específicos
+        if any(word in text_clean for word in ["cada", "intervalo", "periódico", "periodico"]):
+            reminder_info["interval_minutes"] = parse_flexible_frequency(text_clean)
+        else:
+            reminder_info["times"] = parse_flexible_times(text_clean)
+    
+    logger.info(f"Parsed FLEXIBLE reminder info: {reminder_info}")
+    return reminder_info
+
+def parse_reminder_query(text: str, user_phone: str):
+    """Detectar consultas sobre recordatorios existentes - VERSIÓN ULTRA-FLEXIBLE"""
+    text_lower = text.lower().strip()
+    
+    # Patrones ultra-flexibles para consultas
+    query_patterns = [
+        # Preguntas directas
+        r"que\s*recordatorios?\s*tengo",
+        r"cuales?\s*son\s*mis\s*recordatorios?",
+        r"mis\s*recordatorios?",
+        r"ver\s*recordatorios?",
+        r"recordatorios?\s*activos?",
+        r"tengo\s*recordatorios?",
+        r"cuantos?\s*recordatorios?",
+        r"lista\s*de\s*recordatorios?",
+        
+        # Variaciones más naturales
+        r"que\s*(?:me\s*)?(?:estas\s*)?recordando",
+        r"de\s*que\s*(?:me\s*)?(?:tienes\s*que\s*)?recordar",
+        r"que\s*(?:tienes\s*)?(?:programado|configurado)",
+        r"mostrar\s*recordatorios?",
+        r"enseñar\s*recordatorios?",
+        r"dime\s*(?:que\s*)?recordatorios?",
+        r"cuales?\s*recordatorios?",
+        
+        # Con palabras interrogativas
+        r"(?:que|cuales?|cuantos?)\s*.*recordatorios?",
+        r"recordatorios?\s*(?:que\s*)?(?:tengo|hay|existen)",
+        
+        # Formas muy casuales
+        r"recordatorios?\?",
+        r"que\s*hay\s*programado",
+        r"que\s*tienes\s*para\s*mi",
+        r"que\s*me\s*vas\s*a\s*recordar",
+        
+        # Con errores tipográficos comunes
+        r"recordatroios?",
+        r"recrodatorios?",
+        r"recordarios?",
+    ]
+    
+    is_query = any(re.search(pattern, text_lower) for pattern in query_patterns)
+    
+    if is_query:
+        logger.info(f"FLEXIBLE reminder query detected for {user_phone}: '{text}'")
+        return True
+    
+    return False
+
+def parse_reminder_removal(text: str, user_phone: str):
+    """Detectar solicitudes de eliminación de recordatorios específicos"""
+    text_lower = text.lower().strip()
+    
+    # Patrones para eliminar recordatorios específicos
+    removal_patterns = [
+        # Por ID
+        r"(?:elimina|borra|quita|remueve|cancela|detén|detene|para|parar)\s+(?:el\s+)?recordatorio\s+(?:con\s+)?(?:id\s+|#)?(\d+)",
+        r"(?:eliminar|borrar|quitar|remover|cancelar|detener|parar)\s+(?:el\s+)?recordatorio\s+(?:con\s+)?(?:id\s+|#)?(\d+)",
+        r"(?:ya\s+)?no\s+(?:me\s+)?recuerdes\s+(?:el\s+)?(?:recordatorio\s+)?(?:con\s+)?(?:id\s+|#)?(\d+)",
+        r"recordatorio\s+(?:con\s+)?(?:id\s+|#)?(\d+)\s+(?:eliminalo|borralo|quitalo|cancelalo)",
+        
+        # Por número en la lista
+        r"(?:elimina|borra|quita|remueve|cancela|detén|detene|para|parar)\s+(?:el\s+)?recordatorio\s+(?:número\s+|#)?(\d+)",
+        r"(?:eliminar|borrar|quitar|remover|cancelar|detener|parar)\s+(?:el\s+)?recordatorio\s+(?:número\s+|#)?(\d+)",
+        
+        # Directamente el número
+        r"(?:elimina|borra|quita|remueve|cancela|detén|detene|para|parar|eliminar|borrar|quitar|remover|cancelar|detener|parar)\s+(?:el\s+)?(\d+)",
+        r"(?:elimina|borra|quita|remueve|cancela|detén|detene|para|parar|eliminar|borrar|quitar|remover|cancelar|detener|parar)\s+recordatorio\s+(\d+)",
+    ]
+    
+    for pattern in removal_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            reminder_id = int(match.group(1))
+            logger.info(f"Detected reminder removal request for ID {reminder_id}")
+            return reminder_id
+    
+    return None
+
+def format_interval_text(interval_minutes: float) -> str:
+    """Formatear texto de intervalo de forma legible"""
+    if interval_minutes < 1:
+        seconds = int(interval_minutes * 60)
+        return f"cada {seconds} segundos"
+    elif interval_minutes == 1:
+        return "cada minuto"
+    elif interval_minutes < 60:
+        if interval_minutes == int(interval_minutes):
+            return f"cada {int(interval_minutes)} minutos"
+        else:
+            return f"cada {interval_minutes} minutos"
+    else:
+        hours = interval_minutes / 60
+        if hours == int(hours):
+            return f"cada {int(hours)} horas"
+        else:
+            return f"cada {round(hours, 1)} horas"
+
+def create_intelligent_reminder(user_phone: str, reminder_info: dict):
+    """Crear recordatorio con mejor manejo de tipos y soporte decimal"""
+    logger.info(f"Creating intelligent reminder for {user_phone}: {reminder_info}")
+    
+    try:
+        reminder_type = reminder_info["type"]
+        message = reminder_info["message"]
+        nickname = reminder_info.get("nickname", generate_reminder_nickname())
+        
+        # Gestionar recordatorio basado en intervalo
+        if "interval_minutes" in reminder_info and reminder_info.get("interval_minutes") is not None:
+            interval_minutes = float(reminder_info["interval_minutes"])
+            
+            # Validar intervalo mínimo (5 segundos = 0.083 minutos)
+            if interval_minutes < 0.083:
+                return "❌ El intervalo mínimo es 5 segundos. Por favor elige un intervalo mayor."
+            
+            logger.info(f"Creating {reminder_type} reminder: {interval_minutes} minutes interval")
+            
+            reminder_id = save_reminder_supabase(
+                user_phone=user_phone,
+                reminder_type=reminder_type,
+                message=message,
+                interval_minutes=interval_minutes,
+                nickname=nickname
+            )
+            
+            logger.info(f"Supabase save result: reminder_id = {reminder_id}")
+            
+            if reminder_id:
+                try:
+                    job = scheduler.add_job(
+                        func=send_reminder,
+                        trigger=IntervalTrigger(minutes=interval_minutes),
+                        args=[user_phone, message],
+                        id=f"{reminder_type}_{user_phone}_{reminder_id}",
+                        replace_existing=True
+                    )
+                    logger.info(f"Scheduler job created: {job.id} - Next run: {job.next_run_time}")
+                except Exception as scheduler_error:
+                    logger.error(f"Scheduler error: {scheduler_error}")
+                    return f"❌ Error al programar recordatorio: {scheduler_error}"
+                
+                emoji = REMINDER_EMOJIS.get(reminder_type, "🔔")
+                freq_text = format_interval_text(interval_minutes)
+                
+                # Personalizar respuesta según el tipo
+                if reminder_type == "water":
+                    return f"✅ ¡Perfecto! He configurado tu recordatorio de agua {freq_text}.\n\n{emoji} Te recordaré mantenerte hidratado regularmente.\n\n🔍 Recordatorio: *{nickname}*"
+                elif reminder_type == "supplement":
+                    supplement_name = reminder_info.get("supplement_name", "suplemento")
+                    return f"✅ ¡Listo! He configurado tu recordatorio para *{supplement_name}* {freq_text}.\n\n{emoji} Te recordaré tomarlo regularmente.\n\n🔍 Recordatorio: *{nickname}*"
+                else:
+                    return f"✅ ¡Listo! He configurado tu recordatorio de {reminder_type} {freq_text}.\n\n{emoji} Te lo recordaré puntualmente.\n\n🔍 Recordatorio: *{nickname}*"
+            else:
+                logger.error("Failed to save reminder to Supabase")
+                return "❌ Error al guardar recordatorio en la base de datos. Por favor intenta de nuevo."
+        
+        # Gestionar recordatorio basado en horarios específicos
+        elif "times" in reminder_info and reminder_info["times"]:
+            times = reminder_info["times"]
+            logger.info(f"Creating {reminder_type} reminder with specific times: {times}")
+            
+            created_count = 0
+            created_nicknames = []
+            
+            for time_str in times:
+                try:
+                    hour, minute = map(int, time_str.split(':'))
+                    time_nickname = f"{nickname} ({time_str})"
+                    
+                    reminder_id = save_reminder_supabase(
+                        user_phone=user_phone,
+                        reminder_type=reminder_type,
+                        message=message,
+                        cron_expression=f"{minute} {hour} * * *",
+                        nickname=time_nickname
+                    )
+                    
+                    if reminder_id:
+                        scheduler.add_job(
+                            func=send_reminder,
+                            trigger=CronTrigger(hour=hour, minute=minute),
+                            args=[user_phone, message],
+                            id=f"{reminder_type}_{user_phone}_{reminder_id}",
+                            replace_existing=True
+                        )
+                        created_count += 1
+                        created_nicknames.append(time_nickname)
+                        
+                except Exception as e:
+                    logger.error(f"Error creating reminder at {time_str}: {str(e)}")
+                    continue
+            
+            if created_count > 0:
+                emoji = REMINDER_EMOJIS.get(reminder_type, "🔔")
+                times_text = ", ".join(times)
+                nicknames_text = ", ".join([f"*{nick}*" for nick in created_nicknames])
+                
+                # Personalizar respuesta según el tipo
+                if reminder_type == "sleep":
+                    return f"✅ ¡Perfecto! He configurado tu recordatorio para dormir a las {times_text}.\n\n{emoji} Te ayudaré a mantener un buen hábito de sueño.\n\n🔍 Recordatorios: {nicknames_text}"
+                elif reminder_type == "supplement":
+                    supplement_name = reminder_info.get("supplement_name", "suplemento")
+                    return f"✅ ¡Listo! He configurado tu recordatorio para *{supplement_name}* a las {times_text}.\n\n{emoji} Te recordaré tomarlo puntualmente.\n\n🔍 Recordatorios: {nicknames_text}"
+                else:
+                    return f"✅ ¡Configurado! Tu recordatorio de {reminder_type} a las {times_text}.\n\n{emoji} Te lo recordaré puntualmente.\n\n🔍 Recordatorios: {nicknames_text}"
+            else:
+                return "❌ No pude configurar los recordatorios con los horarios especificados. Por favor intenta de nuevo."
+        
+        # Si no hay ni intervalo ni horarios específicos
+        else:
+            logger.error("No valid time or interval information found")
+            return "❌ No pude entender los horarios para tu recordatorio. Por favor especifica cuándo quieres que te recuerde."
+        
+    except Exception as e:
+        logger.error(f"Error creating intelligent reminder: {str(e)}")
+        return f"❌ Hubo un error al configurar el recordatorio: {str(e)}"
+
+def list_user_reminders_intelligent(user_phone: str):
+    """Listar recordatorios con mejor formato para decimales y tipos"""
+    try:
+        reminders = get_user_reminders_supabase(user_phone)
+        logger.info(f"Found {len(reminders)} reminders for {user_phone}")
+        
+        if not reminders:
+            return "📝 No tienes recordatorios activos.\n\n💡 Dime qué quieres recordar y yo lo configuro automáticamente."
+        
+        response = "📝 *Tus recordatorios activos:*\n\n"
+        
+        # Agrupar recordatorios por tipo para mejor visualización
+        reminder_groups = {}
+        for i, reminder in enumerate(reminders, 1):
+            reminder_type = reminder["reminder_type"]
+            if reminder_type not in reminder_groups:
+                reminder_groups[reminder_type] = []
+            reminder_groups[reminder_type].append(reminder)
+        
+        # Mostrar recordatorios organizados por tipo
+        count = 1
+        for reminder_type, group in reminder_groups.items():
+            emoji = REMINDER_EMOJIS.get(reminder_type, "🔔")
+            
+            for reminder in group:
+                nickname = reminder.get("nickname", f"{reminder_type.capitalize()} {reminder['id']}")
+                
+                if reminder["interval_minutes"]:
+                    interval = float(reminder["interval_minutes"])
+                    freq_text = format_interval_text(interval)
+                    response += f"{count}. {emoji} {nickname}: {freq_text} (ID: {reminder['id']})\n"
+                else:
+                    # Extraer hora del cron si está disponible
+                    time_str = "horario específico"
+                    if reminder["cron_expression"]:
+                        parts = reminder["cron_expression"].split()
+                        if len(parts) >= 2:
+                            minute, hour = parts[0], parts[1]
+                            time_str = f"{hour}:{minute.zfill(2)}"
+                    
+                    response += f"{count}. {emoji} {nickname}: {time_str} (ID: {reminder['id']})\n"
+                count += 1
+        
+        response += "\n💡 Para detener todos los recordatorios, escribe: */stop_todo*"
+        response += "\n💡 Para eliminar uno específico, escribe: *Elimina recordatorio 3*" 
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error listing user reminders: {str(e)}")
+        return "❌ Error al obtener tus recordatorios. Inténtalo de nuevo."
+
+# ==================== REMINDER SENDING ====================
+
+def send_reminder(user_phone: str, message: str):
+    """Enviar un mensaje de recordatorio"""
+    try:
+        send_result = send_whatsapp_message(user_phone, f"{message}")
+        logger.info(f"Reminder sent to {user_phone}: {message}")
+        return send_result
+    except Exception as e:
+        logger.error(f"Error sending reminder to {user_phone}: {str(e)}")
+        return None
+
+# ==================== MESSAGE PROCESSING ====================
+
+def process_message(sender: str, message_text: str) -> str:
+    """Process a message - VERSIÓN MEJORADA con mejor detección de intención"""
+    try:
+        logger.info(f"Processing message from {sender}: '{message_text}'")
+        
+        # Verificar si es un comando manual de recordatorio
+        if message_text.lower().startswith('/'):
+            logger.info("Processing as manual command")
+            return handle_reminder_command(sender, message_text)
+        
+        # Obtener o inicializar historial del usuario desde Supabase
+        chat_history = get_chat_history_from_supabase(sender, limit=20)
+        
+        if not chat_history:
+            chat_history = initialize_user_chat(sender)
+        
+        # Guardar mensaje del usuario en Supabase
+        user_message_id = save_message_to_supabase(sender, "user", message_text)
+        logger.info(f"User message saved with ID: {user_message_id}")
+        
+        # PASO 1: Verificar si es una consulta sobre recordatorios existentes
+        if parse_reminder_query(message_text, sender):
+            logger.info("DETECTED REMINDER QUERY - Listing reminders...")
+            response = list_user_reminders_intelligent(sender)
+            save_message_to_supabase(sender, "assistant", response)
+            return response
+        
+        # PASO 2: Verificar si es una solicitud de eliminación de recordatorio específico
+        reminder_id_to_remove = parse_reminder_removal(message_text, sender)
+        if reminder_id_to_remove is not None:
+            logger.info(f"DETECTED REMINDER REMOVAL REQUEST - Removing reminder {reminder_id_to_remove}...")
+            success = deactivate_reminder_supabase(sender, reminder_id_to_remove)
+            
+            if success:
+                # Intentar también detener el job en el scheduler
+                try:
+                    for job in scheduler.get_jobs():
+                        if f"_{sender}_{reminder_id_to_remove}" in job.id:
+                            scheduler.remove_job(job.id)
+                            logger.info(f"Removed scheduler job for reminder ID {reminder_id_to_remove}")
+                except Exception as e:
+                    logger.error(f"Error removing scheduler job: {str(e)}")
+                
+                response = f"✅ Recordatorio #{reminder_id_to_remove} eliminado correctamente."
+            else:
+                response = f"❌ No pude eliminar el recordatorio con ID {reminder_id_to_remove}. ¿Seguro que es correcto?"
+            
+            save_message_to_supabase(sender, "assistant", response)
+            return response
+        
+        # PASO 3: Verificar si es una solicitud de información sobre productos o suplementos
+        if is_information_request(message_text) or is_specific_product_request(message_text):
+            logger.info("DETECTED INFORMATION REQUEST - Generating AI response...")
+            
+            current_history = chat_history.copy()
+            current_history.append({"role": "user", "content": message_text})
+            
+            response = generate_ai_response_with_context(
+                current_history, 
+                message_text, 
+                sender
+            )
+            
+            ai_message_id = save_message_to_supabase(sender, "assistant", response)
+            logger.info(f"Generated and saved AI information response")
+            return response
+        
+        # PASO 4: Verificar si es una solicitud de creación de recordatorio (ULTRA-FLEXIBLE)
+        reminder_info = parse_reminder_request(message_text, sender)
+        
+        if reminder_info and reminder_info.get("detected"):
+            logger.info("DETECTED FLEXIBLE REMINDER REQUEST - Creating reminder...")
+            response = create_intelligent_reminder(sender, reminder_info)
+            logger.info(f"Reminder creation response: {response}")
+            save_message_to_supabase(sender, "assistant", response)
+            return response
+        
+        # PASO 5: Procesar como conversación normal
+        logger.info("No specific intent detected - processing as normal conversation")
+        
+        current_history = chat_history.copy()
+        current_history.append({"role": "user", "content": message_text})
+        
+        # Generate AI response with retry mechanism
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = generate_ai_response_with_context(
+                    current_history, 
+                    message_text, 
+                    sender
+                )
+                
+                ai_message_id = save_message_to_supabase(sender, "assistant", response)
+                
+                if ai_message_id:
+                    logger.info(f"Generated and saved AI response")
+                    return response
+                else:
+                    logger.error(f"Failed to save AI response for {sender}")
+                    return response
+            
+            except Exception as e:
+                logger.error(f"Attempt {attempt+1}/{max_retries} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(1)
+        
+    except Exception as e:
+        logger.error(f"Error processing message: {str(e)}")
+        return "Lo siento, tuve un problema procesando tu mensaje. Por favor intenta de nuevo."
+
+def generate_ai_response_with_context(chat_history: List[Dict[str, str]], user_message: str, user_phone: str) -> str:
+    """Generate a response using the Google Gemini model with enhanced context."""
+    import google.generativeai as genai
+    
+    genai.configure(api_key=GOOGLE_API_KEY)
+    
+    generation_config = {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 0,
+        "max_output_tokens": 1000,
+    }
+    
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    ]
+    
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        generation_config=generation_config,
+        safety_settings=safety_settings,
+    )
+    
+    # Format conversation history
+    formatted_history = []
+    for message in chat_history:
+        role = "user" if message["role"] == "user" else "model"
+        formatted_history.append({"role": role, "parts": [message["content"]]})
+    
+    # Obtener estadísticas del usuario para personalización
+    user_stats = get_user_stats(user_phone)
+    active_reminders = get_user_reminders_supabase(user_phone)
+    
+    user_context = ""
+    if user_stats.get("total_messages", 0) > 5:
+        user_context = f"Este usuario ha tenido {user_stats['total_messages']} mensajes contigo, así que ya te conoce."
+    
+    reminders_context = ""
+    if active_reminders:
+        reminder_types = [r['reminder_type'] for r in active_reminders]
+        reminders_context = f"Este usuario tiene {len(active_reminders)} recordatorios activos: {', '.join(reminder_types)}"
+    
+    system_message = f"""
+    Tu nombre es *Noa*, asistente personal entrenada por Diego. Eres cálida,
+    clara y cercana. Respondes siempre en el idioma del usuario.
+    
+    # CONTEXTO DEL USUARIO
+    {user_context}
+    {reminders_context}
+    
+    # 1. BIENVENIDA (envía como DOS textos seguidos, cada uno <400 car.)
+    Hola! Soy Noa, tu asistente personal entrenada por Diego. Sí, soy un
+    robot… ¡pero nada frío ni cuadrado! 😅 He escuchado dos años de consultas,
+    charlas y hasta sus chistes. 🧠💛
+    
+    Disponible 24/7 para resolver dudas, elegir suplementos o descifrar
+    datos de tu test, sin drama. ✨ También configuro recordatorios automáticamente
+    cuando me lo pidas en lenguaje natural. 💬
+    
+    # 2. FORMATO WHATSAPP
+    - 1–3 líneas por mensaje (<400 car.).
+    - *Negritas* y *cursivas* para resaltar. Emoji opcional, máx. 1 🙂
+    - URLs completas ("https://…") en su propia línea → toque único para abrir.
+    - No uses formato Markdown de enlaces (nada de [ ]( )). Escribe la URL tal cual.
+      • Si necesitas dar >1 URL, reparte en varios mensajes (máx. 3 enlaces por
+        mensaje, cada uno en línea aparte).
+    - Primer consejo de salud → añade _«Esto no sustituye la opinión de un
+      profesional de la salud.»_
+    - Primer dato personal recibido → añade _«Tus datos se manejan de forma
+      confidencial y segura.»_
+    
+    # 3. INSTRUCCIONES IMPORTANTES
+    - DIFERENCIA CLARAMENTE entre preguntas sobre productos/información y solicitudes de recordatorios.
+    - Cuando el usuario pregunta "¿Qué puedo tomar?" o similar, DEBES entender que busca recomendaciones, NO quiere un recordatorio.
+    - Si el usuario pregunta sobre suplementos para alguna condición, recomienda productos relevantes del catálogo sin crear recordatorios.
+    - SOLO crea recordatorios cuando el usuario EXPLÍCITAMENTE pide que le recuerdes algo.
+    - Los recordatorios son para: agua, suplementos, dormir, meditar, ejercicio, etc.
+    - Si hay ambigüedad, PREGUNTA primero: "¿Quieres que te recomiende algo para X o prefieres que te configure un recordatorio?"
+    
+    # 4. FUENTES
+    {knowledge_content}
+    
+    {knowledge_product}
+ 
+    # 4. CUÁNDO MENCIONAR EPIGEN
+    Solo cuando el usuario:
+    - Pregunte por un test o suplemento Epigen, o
+    - Indique que ya completó un test.
+    - Ya ha conversado mucho con respecto a un tema y hay suficientes detalles para saber que test le seria util al usuario
+
+    # 5. FLUJO PARA TESTS
+    1. Pregunta si tiene resultados y que los envie directamente a Epigen, ya que aun no puedes procesar documentos o imagenes
+    2. Si los comparte, aplica el “Cuestionario general para después de un test”,
+       una pregunta por mensaje; detente cuando lo pida.
+       • Si hay varios tests, pídele elegir uno primero.
+    3. Al cerrar la dinámica (o si lo solicita) describe suplementos ligados al
+       test, sin precios salvo que pregunte.
+
+    # 6. PREGUNTAS DE COMPRA
+    Cuando el usuario diga “¿Dónde lo compro?” o similar:
+    1. Busca el suplemento en `knowledge_product`.
+    2. Envía un mensaje con nombre y breve nota de calidad.
+    3. Luego reparte las URLs (máx. 3 por mensaje) en líneas aparte, por ej.:
+       🔗 https://mercadolibre.com/sec/19cm8d4
+       🔗 https://mercadolibre.com/sec/1LMdCut
+    4. Cierra con: “Si algún enlace no está disponible, avísame y te paso otra
+       opción.”
+
+    # 7. FUERA DE DOMINIO
+    Si preguntan algo ajeno a salud, bienestar o epigenética:
+    _«No manejo ese tema, pero lo que puedo decirte en base a lo que se es lo siguiente.»_
+
+    # 8. LÍMITES
+    - Sin diagnósticos definitivos.
+    - Cero marketing invasivo.
+    - Los recordatorios son una herramienta de apoyo, no reemplazan supervisión médica.
+    """
+    
+    formatted_history.insert(0, {"role": "model", "parts": [system_message]})
+    
+    # Generate response
+    chat = model.start_chat(history=formatted_history)
+    response = chat.send_message(user_message)
+    
+    return response.text
+
+def handle_reminder_command(sender: str, command: str) -> str:
+    """Manejar comandos manuales de recordatorios"""
+    command = command.lower().strip()
+    
+    if command == '/ayuda' or command == '/help':
+        return """🤖 *Comandos de Recordatorios:*
+
+*Ultra-Flexible (recomendado):*
+• "Recuérdame tomar agua cada 30 segundos"
+• "Mi magnesio cada 1.5 horas"
+• "Recordatorio para dormir a las 10 pm"
+• "Recuérdame meditar por la mañana"
+• "¿Qué recordatorios tengo?"
+• "Elimina recordatorio 3" (para borrar el #3)
+
+*Comandos manuales:*
+• */agua* - Recordatorio de agua cada hora
+• */dormir* - Recordatorio para dormir a las 10pm
+• */mis_recordatorios* - Ver recordatorios activos
+• */stop_todo* - Detener todos los recordatorios
+
+¡Solo dime qué quieres recordar de cualquier forma! 😊"""
+    
+    elif command == '/agua':
+        nickname = "Hidratación Regular"
+        reminder_id = save_reminder_supabase(
+            user_phone=sender,
+            reminder_type="water",
+            message=f"{REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud.",
+            interval_minutes=60.0,  # Usar float explícitamente
+            nickname=nickname
+        )
+        
+        if reminder_id:
+            scheduler.add_job(
+                func=send_reminder,
+                trigger=IntervalTrigger(hours=1),
+                args=[sender, f"{REMINDER_EMOJIS['water']} ¡Es hora de tomar agua! Mantente hidratado para tu salud."],
+                id=f"water_{sender}_{reminder_id}",
+                replace_existing=True
+            )
+            return f"💧 ¡Recordatorio de agua activado! Te recordaré cada hora.\n\n🔍 Recordatorio: *{nickname}*"
+        else:
+            return "❌ Error al crear recordatorio de agua."
+    
+    elif command == '/dormir':
+        nickname = "Descanso Nocturno"
+        reminder_id = save_reminder_supabase(
+            user_phone=sender,
+            reminder_type="sleep",
+            message=f"{REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud.",
+            cron_expression="0 22 * * *",  # 10:00 PM
+            nickname=nickname
+        )
+        
+        if reminder_id:
+            scheduler.add_job(
+                func=send_reminder,
+                trigger=CronTrigger(hour=22, minute=0),
+                args=[sender, f"{REMINDER_EMOJIS['sleep']} Es hora de prepararte para dormir. Un buen descanso es clave para tu salud."],
+                id=f"sleep_{sender}_{reminder_id}",
+                replace_existing=True
+            )
+            return f"😴 ¡Recordatorio para dormir activado! Te avisaré a las 10:00 PM.\n\n🔍 Recordatorio: *{nickname}*"
+        else:
+            return "❌ Error al crear recordatorio para dormir."
+    
+    elif command == '/meditar':
+        nickname = "Meditación Diaria"
+        reminder_id = save_reminder_supabase(
+            user_phone=sender,
+            reminder_type="meditation",
+            message=f"{REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración.",
+            cron_expression="0 8 * * *",  # 8:00 AM
+            nickname=nickname
+        )
+        
+        if reminder_id:
+            scheduler.add_job(
+                func=send_reminder,
+                trigger=CronTrigger(hour=8, minute=0),
+                args=[sender, f"{REMINDER_EMOJIS['meditation']} Momento de meditar. Tómate unos minutos para conectar con tu respiración."],
+                id=f"meditation_{sender}_{reminder_id}",
+                replace_existing=True
+            )
+            return f"🧘 ¡Recordatorio para meditar activado! Te avisaré a las 8:00 AM.\n\n🔍 Recordatorio: *{nickname}*"
+        else:
+            return "❌ Error al crear recordatorio para meditar."
+    
+    elif command == '/ejercicio':
+        nickname = "Entrenamiento Diario"
+        reminder_id = save_reminder_supabase(
+            user_phone=sender,
+            reminder_type="exercise",
+            message=f"{REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día.",
+            cron_expression="0 17 * * *",  # 5:00 PM
+            nickname=nickname
+        )
+        
+        if reminder_id:
+            scheduler.add_job(
+                func=send_reminder,
+                trigger=CronTrigger(hour=17, minute=0),
+                args=[sender, f"{REMINDER_EMOJIS['exercise']} ¡Es hora de moverte! Un poco de ejercicio mejorará tu día."],
+                id=f"exercise_{sender}_{reminder_id}",
+                replace_existing=True
+            )
+            return f"🏃 ¡Recordatorio para ejercicio activado! Te avisaré a las 5:00 PM.\n\n🔍 Recordatorio: *{nickname}*"
+        else:
+            return "❌ Error al crear recordatorio para ejercicio."
+    
+    elif command == '/mis_recordatorios':
+        return list_user_reminders_intelligent(sender)
+    
+    elif command == '/stop_todo':
+        if supabase:
+            result = supabase.table("reminders").update({"is_active": False}).eq("user_phone", sender).execute()
+            count = len(result.data) if result.data else 0
+        else:
+            count = 0
+        
+        jobs = scheduler.get_jobs()
+        scheduler_count = 0
+        for job in jobs:
+            if sender in job.id:
+                scheduler.remove_job(job.id)
+                scheduler_count += 1
+        
+        return f"✅ Se han desactivado {count} recordatorios."
+    
+    else:
+        return "❌ Comando no reconocido. Escribe */ayuda* para ver comandos.\n\n💡 ¡Solo dime qué quieres recordar de forma natural!"
+
+# ==================== INITIALIZATION ====================
+
+def load_and_schedule_reminders():
+    """Cargar y programar todos los recordatorios desde Supabase con soporte decimal"""
+    try:
+        reminders = load_reminders_supabase()
+        scheduled_count = 0
+        
+        for reminder in reminders:
+            try:
+                user_phone = reminder["user_phone"]
+                reminder_type = reminder["reminder_type"]
+                message = reminder["message"]
+                reminder_id = reminder["id"]
+                
+                if reminder["interval_minutes"]:
+                    interval_minutes = float(reminder["interval_minutes"])  # Convertir a float
+                    
+                    scheduler.add_job(
+                        func=send_reminder,
+                        trigger=IntervalTrigger(minutes=interval_minutes),
+                        args=[user_phone, message],
+                        id=f"{reminder_type}_{user_phone}_{reminder_id}",
+                        replace_existing=True
+                    )
+                    scheduled_count += 1
+                    logger.info(f"Scheduled interval reminder: {interval_minutes} minutes")
+                    
+                elif reminder["cron_expression"]:
+                    parts = reminder["cron_expression"].split()
+                    if len(parts) >= 2:
+                        minute, hour = int(parts[0]), int(parts[1])
+                        
+                        scheduler.add_job(
+                            func=send_reminder,
+                            trigger=CronTrigger(minute=minute, hour=hour),
+                            args=[user_phone, message],
+                            id=f"{reminder_type}_{user_phone}_{reminder_id}",
+                            replace_existing=True
+                        )
+                        scheduled_count += 1
+                        logger.info(f"Scheduled cron reminder: {hour}:{minute:02d}")
+                        
+            except Exception as e:
+                logger.error(f"Error scheduling reminder {reminder.get('id', 'unknown')}: {str(e)}")
+                continue
+        
+        logger.info(f"Successfully scheduled {scheduled_count} reminders from Supabase")
+        return scheduled_count
+        
+    except Exception as e:
+        logger.error(f"Error loading reminders from Supabase: {str(e)}")
+        return 0
+
+def initialize_system():
+    """Inicializar sistema completo"""
+    logger.info("Initializing complete system with ULTRA-FLEXIBLE intelligent reminders and DECIMAL support...")
+    
+    if not supabase:
+        logger.warning("Supabase not configured - persistent features will not work")
+        return False
+    
+    try:
+        reminders_test = supabase.table("reminders").select("count", count="exact").execute()
+        chat_test = supabase.table("chat_history").select("count", count="exact").execute()
+        
+        logger.info(f"Connected to Supabase successfully")
+        logger.info(f"Reminders in DB: {reminders_test.count}")
+        logger.info(f"Chat messages in DB: {chat_test.count}")
+        
+        scheduled_count = load_and_schedule_reminders()
+        
+        logger.info(f"System initialized successfully. Scheduled {scheduled_count} reminders.")
+        logger.info("ULTRA-FLEXIBLE reminder parsing with DECIMAL support enabled!")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize system: {str(e)}")
+        return False
+
+# ==================== ROUTE HANDLERS ====================
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        "status": "online",
+        "message": "Epigen WhatsApp webhook server with ULTRA-FLEXIBLE intelligent reminders and DECIMAL support",
+        "version": "6.0.0",
+        "features": [
+            "AI Chat with Persistent History", 
+            "ULTRA-FLEXIBLE Reminder Detection", 
+            "DECIMAL Interval Support",
+            "Smart Reminder Queries",
+            "Natural Language Processing",
+            "Manual Reminder Commands",
+            "Supabase Integration",
+            "Multiple Reminder Types",
+            "Better Intent Detection",
+            "User-Friendly Reminder Nicknames"
+        ]
+    }), 200
+
+@app.route('/webhook', methods=['GET', 'POST'])
+def webhook():
+    logger.info(f"Webhook called with method: {request.method}")
+    
+    if request.method == 'GET':
+        logger.info("Received webhook verification request")
+        return jsonify({"status": "webhook is active"}), 200
+    
+    try:
+        raw_data = request.get_data(as_text=True)
+        data = request.get_json()
+        
+        if data.get("typeWebhook") == "incomingMessageReceived":
+            message_data = data.get("messageData", {})
+            
+            if message_data.get("typeMessage") == "textMessage":
+                sender = data["senderData"]["sender"].split("@")[0]
+                message_text = message_data["textMessageData"]["textMessage"]
+                logger.info(f"Received message from {sender}: {message_text}")
+                
+                ai_response = process_message(sender, message_text)
+                logger.info(f"Generated response: {ai_response[:100]}...")
+                
+                send_result = send_whatsapp_message(sender, ai_response)
+                logger.info(f"Send result: {send_result}")
+                
+        return jsonify({"status": "message processed"}), 200
+    
+    except Exception as e:
+        logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    green_api_status = "configured" if GREEN_API_ID and GREEN_API_TOKEN else "not configured"
+    google_api_status = "configured" if GOOGLE_API_KEY else "not configured"
+    supabase_status = "configured" if supabase else "not configured"
+    
+    supabase_stats = {}
+    if supabase:
+        try:
+            reminders_result = supabase.table("reminders").select("count", count="exact").execute()
+            messages_result = supabase.table("chat_history").select("count", count="exact").execute()
+            
+            supabase_stats = {
+                "total_reminders": reminders_result.count,
+                "total_messages": messages_result.count,
+                "connection": "healthy"
+            }
+        except Exception as e:
+            supabase_stats = {
+                "connection": "error",
+                "error": str(e)
+            }
+    
+    return jsonify({
+        "status": "healthy",
+        "timestamp": time.time(),
+        "services": {
+            "green_api": green_api_status,
+            "google_ai": google_ai_status,
+            "supabase": supabase_status
+        },
+        "scheduled_jobs": len(scheduler.get_jobs()) if scheduler else 0,
+        "supabase_stats": supabase_stats,
+        "features": {
+            "ultra_flexible_reminders": True,
+            "decimal_interval_support": True,
+            "intelligent_queries": True,
+            "persistent_chat": True,
+            "manual_commands": True,
+            "natural_language_processing": True,
+            "multiple_reminder_types": True,
+            "better_intent_detection": True,
+            "friendly_reminder_nicknames": True
+        }
+    }), 200
+
+@app.route('/active_reminders', methods=['GET'])
+def get_active_reminders():
+    try:
+        if not supabase:
+            return jsonify({"status": "error", "message": "Supabase not configured"}), 500
+            
+        result = supabase.table("reminders").select("user_phone, nickname, reminder_type, message, interval_minutes, is_active, created_at").order("created_at", desc=True).limit(20).execute()
+        
+        jobs = scheduler.get_jobs()
+        active_jobs = [{"id": job.id, "next_run": str(job.next_run_time)} for job in jobs]
+        
+        return jsonify({
+            "status": "success",
+            "reminders_in_db": len(result.data) if result.data else 0,
+            "active_jobs": len(active_jobs),
+            "jobs": active_jobs[:10],
+            "reminders": [
+                {
+                    "user": r["user_phone"],
+                    "nickname": r.get("nickname", "N/A"),
+                    "type": r["reminder_type"],
+                    "message": r["message"][:50] + "..." if len(r["message"]) > 50 else r["message"],
+                    "interval": r["interval_minutes"],
+                    "active": r["is_active"],
+                    "created": r["created_at"]
+                } for r in (result.data[:10] if result.data else [])
+            ]
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/chat_stats/<phone>', methods=['GET'])
+def get_chat_stats(phone):
+    try:
+        stats = get_user_stats(phone)
+        recent_messages = get_chat_history_from_supabase(phone, limit=5)
+        active_reminders = get_user_reminders_supabase(phone)
+        
+        return jsonify({
+            "status": "success",
+            "user_phone": phone,
+            "stats": stats,
+            "recent_messages_count": len(recent_messages),
+            "active_reminders_count": len(active_reminders),
+            "reminders": [r["reminder_type"] for r in active_reminders],
+            "reminder_nicknames": [r.get("nickname", "N/A") for r in active_reminders]
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ==================== WHATSAPP INTEGRATION ====================
+
+def send_whatsapp_message(recipient: str, message: str) -> Optional[Dict[str, Any]]:
+    url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
+    
+    payload = {
+        "chatId": f"{recipient}@c.us",
+        "message": message
+    }
+    
+    try:
+        response = requests.post(url, json=payload)
+        response_data = response.json()
+        
+        if response.status_code == 200 and response_data.get("idMessage"):
+            logger.info(f"Message sent to {recipient}: {message[:50]}...")
+        else:
+            logger.error(f"Error sending message: {response_data}")
+        
+        return response_data
+    
+    except Exception as e:
+        logger.error(f"Exception when sending message: {str(e)}")
+        return None
+
+# ==================== SERVER STARTUP ====================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    initialize_system()
+    
+    port = int(os.environ.get('PORT', 7860))
+    
+    logger.info(f"Starting server on port {port}")
+    logger.info("🤖 ULTRA-FLEXIBLE Reminder System with DECIMAL Support Ready!")
+    logger.info("Users can now request reminders with precise intervals:")
+    logger.info("  • 'Recuérdame tomar agua cada 30 segundos'")
+    logger.info("  • 'Mi magnesio cada 1.5 horas'")
+    logger.info("  • 'Vitamina D cada 45 minutos'")
+    logger.info("  • 'Recordatorio para dormir a las 10 pm'")
+    logger.info("  • 'Recuérdame meditar por la mañana'")
+    logger.info("  • Y MUCHAS más formas naturales con precisión decimal!")
+    
+    uvicorn.run("app:app", host="0.0.0.0", port=port, interface="wsgi")
